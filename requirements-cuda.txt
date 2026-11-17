@@ -1,0 +1,4 @@
+# CUDA 12 cuBLAS and cuDNN 9 DLLs for CTranslate2 on Windows (skip with setup.ps1 -SkipCudaLibs
+# when they are already available, e.g. from a PyTorch install; then set cuda_dll_dir in config.json).
+nvidia-cublas-cu12>=12.4,<13
+nvidia-cudnn-cu12>=9.1,<10

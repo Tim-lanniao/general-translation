@@ -1,0 +1,17 @@
+{
+  "asr_model_dir": "models\\faster-whisper-large-v3-turbo",
+  "cuda_dll_dir": "",
+  "cache_dir": "",
+  "llm_url": "http://127.0.0.1:18081",
+  "llm_model": "qwen3.8-flash-next-iq3_s",
+  "llm_label": "Qwen3.8-Flash-Next",
+  "llm_controller": "",
+  "llama_server": "C:\\tools\\llama.cpp\\llama-server.exe",
+  "hymt_model": "C:\\models\\Hy-MT2-7B-GGUF\\HY-MT2-7B-Q6_K.gguf",
+  "hymt_port": 18082,
+  "gpu_lock": "",
+  "sample_wav": "",
+  "translator": "qwen",
+  "topic": "",
+  "terms": ""
+}
