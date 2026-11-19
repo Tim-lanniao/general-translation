@@ -15,6 +15,7 @@ import socket
 import subprocess
 import time
 import urllib.request
+from concurrent.futures import CancelledError
 from pathlib import Path
 
 from . import config
@@ -31,24 +32,43 @@ def _http_ok(url: str, timeout: float = 1.0) -> bool:
         return False
 
 
-def _stream_chat(url: str, body: dict, timeout: float = 30) -> tuple[str, float, str | None]:
+def _stream_chat(url: str, body: dict, timeout: float = 30, *, on_partial=None, cancelled=None) -> tuple[str, float, str | None]:
     req = urllib.request.Request(url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"), headers={"Content-Type": "application/json"})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     start = time.perf_counter()
+    next_preview = start
     parts, finish = [], None
+    done = False
+    if cancelled and cancelled():
+        raise CancelledError()
     with opener.open(req, timeout=timeout) as resp:
         for line in resp:
-            if not line.startswith(b"data: "):
+            if cancelled and cancelled():
+                raise CancelledError()
+            if not line.startswith(b"data:"):
                 continue
-            payload = line[6:].strip()
+            payload = line[5:].strip()
             if payload == b"[DONE]":
+                done = True
                 break
             event = json.loads(payload)
             for c in event.get("choices", []):
-                parts.append(c.get("delta", {}).get("content") or "")
+                delta = c.get("delta", {}).get("content")
                 if c.get("finish_reason"):
                     finish = c["finish_reason"]
+                if not delta:
+                    continue
+                parts.append(delta)
+                if on_partial and not finish and time.perf_counter() >= next_preview:
+                    preview = _LEAK.sub("", "".join(parts).strip()).strip()
+                    if len(preview) >= 4 and preview != "当前语句":
+                        on_partial(preview)
+                        next_preview = time.perf_counter() + 0.18
+    if not (done or finish):
+        raise RuntimeError("本地翻译服务在译文完成前断开了连接")
     text = _LEAK.sub("", "".join(parts).strip()).strip()
+    if not text:
+        raise RuntimeError("本地翻译服务返回了空译文")
     return text, time.perf_counter() - start, finish
 
 
@@ -108,7 +128,7 @@ class LLMTranslator:
             finally:
                 self.owned = False
 
-    def translate(self, source: str, context: str, topic: str, terms: str, context_chars: int = 160) -> dict:
+    def translate(self, source: str, context: str, topic: str, terms: str, context_chars: int = 160, *, on_partial=None, cancelled=None) -> dict:
         scene = topic.strip() or "Teams 工作会议"
         system = ("将德语口语译成简体中文，只输出当前语句译文。保留数字、否定、疑问和残句，不补写。"
                   f"场景是{scene}。只纠正上下文明显支持的识别错词。")
@@ -117,7 +137,7 @@ class LLMTranslator:
         user = ("前文仅供理解：" + context[-context_chars:] + "\n\n" if context else "") + "当前语句：\n" + source
         body = {"model": self.cfg["llm_model"], "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 "temperature": 0, "max_tokens": 256, "stream": True, "chat_template_kwargs": {"enable_thinking": False}}
-        text, seconds, finish = _stream_chat(self.url + "/v1/chat/completions", body)
+        text, seconds, finish = _stream_chat(self.url + "/v1/chat/completions", body, on_partial=on_partial, cancelled=cancelled)
         return {"translation": text, "mt_s": seconds, "finish_reason": finish}
 
 
@@ -168,7 +188,7 @@ class HyMT7BTranslator:
                 self.proc.kill()
         self.proc = None
 
-    def translate(self, source: str, context: str, topic: str, terms: str, context_chars: int = 240) -> dict:
+    def translate(self, source: str, context: str, topic: str, terms: str, context_chars: int = 240, *, on_partial=None, cancelled=None) -> dict:
         background = f"这是一场{topic.strip() or 'Teams 工作会议'}的德语发言。"
         if terms.strip():
             background += f"\n人名和术语：{terms.strip()}"
@@ -177,7 +197,7 @@ class HyMT7BTranslator:
         prompt = "[背景信息]\n" + background + "\n\n请结合背景信息将以下文本翻译为简体中文。只输出译文。\n\n[待翻译文本]\n" + source
         body = {"messages": [{"role": "user", "content": prompt}], "temperature": 0, "top_p": 1, "max_tokens": 512, "stream": True, "seed": 42,
                 "chat_template_kwargs": {"enable_thinking": False}}
-        text, seconds, finish = _stream_chat(self.url + "/v1/chat/completions", body)
+        text, seconds, finish = _stream_chat(self.url + "/v1/chat/completions", body, on_partial=on_partial, cancelled=cancelled)
         return {"translation": text, "mt_s": seconds, "finish_reason": finish}
 
 

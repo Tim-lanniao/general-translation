@@ -48,6 +48,7 @@ DEFAULTS = {
     # ---- pipeline (values from the author's real-time replay evaluation)
     "window_seconds": 12,
     "update_seconds": 2,
+    "first_update_seconds": 1.4, # first draft only; subsequent updates use update_seconds
     "vad_final_silence_ms": 600,
     "beam_size": 5,
     "context_chars": 160,

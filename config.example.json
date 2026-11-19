@@ -12,6 +12,7 @@
   "gpu_lock": "",
   "sample_wav": "",
   "translator": "qwen",
+  "first_update_seconds": 1.4,
   "topic": "",
   "terms": ""
 }

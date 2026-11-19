@@ -350,11 +350,16 @@ class StreamResampler:
     def __init__(self, src_rate: int, dst_rate: int = TARGET_RATE):
         g = math.gcd(src_rate, dst_rate)
         self.up, self.down = dst_rate // g, src_rate // g
-        self.margin = self.down * math.ceil(64 / self.down)
+        radius = math.ceil(10 * max(self.up, self.down) / self.up)
+        self.margin = self.down * math.ceil(max(64, radius) / self.down)
         self.buf = np.zeros(self.margin, np.float32)
         if (self.up, self.down) != (1, 1):
-            from scipy.signal import resample_poly
+            from scipy.signal import firwin, resample_poly
             self._resample = resample_poly
+            # Same float32 Kaiser low-pass as resample_poly's default. A WASAPI
+            # session has one sample rate, so design the FIR once for all packets.
+            rate = max(self.up, self.down)
+            self.taps = firwin(20 * rate + 1, 1.0 / rate, window=("kaiser", 5.0)).astype(np.float32)
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
         if self.up == self.down:
@@ -363,9 +368,9 @@ class StreamResampler:
         n = ((len(self.buf) - 2 * self.margin) // self.down) * self.down
         if n <= 0:
             return np.zeros(0, np.float32)
-        y = self._resample(self.buf[: n + 2 * self.margin], self.up, self.down)
+        y = self._resample(self.buf[: n + 2 * self.margin], self.up, self.down, window=self.taps)
         o0 = self.margin // self.down * self.up
-        out = y[o0 : o0 + n // self.down * self.up].astype(np.float32)
+        out = y[o0 : o0 + n // self.down * self.up].astype(np.float32, copy=False)
         self.buf = self.buf[n:]
         return out
 

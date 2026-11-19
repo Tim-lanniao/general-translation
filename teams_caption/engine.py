@@ -2,10 +2,11 @@
 
 Pipeline (parameters from the author's real-time replay evaluation, 2026-11-16):
   loopback audio 16 kHz mono -> causal Silero VAD (512-sample frames, 600 ms pause
-  ends a sentence) -> every 2 s re-recognise the open sentence (<= 12 s window) with
+  ends a sentence) -> first look at 1.4 s, then re-recognise the open sentence
+  on the 2 s cadence (<= 12 s window) with
   faster-whisper large-v3-turbo (CUDA FP16, beam 5) -> translate -> *replace* the
-  provisional caption; after the pause the whole sentence is recognised and
-  translated once more and becomes the final caption.
+  provisional caption. The full uncommitted audio is recognised at the confirmed
+  pause. An exact matching translation can be reused for the final caption.
 
 Sentences longer than ~10 s are committed at a sentence/clause boundary taken
 from Whisper word timestamps, so no speech falls out of the 12 s window.
@@ -23,6 +24,7 @@ import subprocess
 import threading
 import time
 import wave
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -89,6 +91,7 @@ class CausalVAD:
         self.session = get_vad_model().session
         self.ring = ring
         self.silence_samples = round(silence_ms * 16)
+        self.preview_silence = max(SR // 4, self.silence_samples - int(0.35 * SR))
         self.on_change = on_change
         self.lock = threading.Lock()
         self.finals: collections.deque = collections.deque()
@@ -130,23 +133,31 @@ class CausalVAD:
                     self.ring.cond.wait(0.1)
                     continue
             while self.ring.total - self.pos >= 512 and not self._stop.is_set():
-                frame = self.ring.get(self.pos, self.pos + 512)
+                position = self.pos
+                frame = self.ring.get(position, position + 512)
                 if len(frame) < 512:  # fell out of the ring (should not happen)
-                    self.pos = self.ring.base
+                    with self.lock:
+                        self.pos = max(self.pos, self.ring.base)
                     continue
-                self._frame(frame.reshape(1, 512))
+                self._frame(position, frame.reshape(1, 512))
 
-    def _frame(self, frame: np.ndarray):
-        probs, self.h, self.c = self.session.run(None, {"input": np.concatenate([self.context, frame], axis=1), "h": self.h, "c": self.c})
-        self.context = frame[:, -64:]
+    def _frame(self, a: int, frame: np.ndarray):
+        with self.lock:
+            if self.pos != a:
+                return
+            context, h, c = self.context, self.h, self.c
+        probs, h, c = self.session.run(None, {"input": np.concatenate([context, frame], axis=1), "h": h, "c": c})
         prob = float(np.asarray(probs).flat[0])
-        a = self.pos
         end = a + 512
         changed = False
         with self.lock:
+            if self.pos != a:  # pause or source switch while Silero was running
+                return
+            self.h, self.c, self.context = h, c, frame[:, -64:]
             if prob >= 0.5:
                 self.last_speech = end
                 self.last_speech_wall = time.perf_counter()
+                changed = self.silence is not None
                 self.silence = None
                 if self.active is None:
                     self.active = max(self.last_commit, a - 3200)
@@ -156,6 +167,8 @@ class CausalVAD:
                 self.silence = a
             if self.active is not None:
                 quiet = self.silence is not None and end - self.silence >= self.silence_samples
+                if self.silence is not None and a - self.silence < self.preview_silence <= end - self.silence:
+                    changed = True
                 if quiet and end - self.active >= SR:
                     self.finals.append({"seq": self.seq, "start": self.active, "end": end, "speech_end": self.last_speech})
                     self.last_commit = end
@@ -175,14 +188,18 @@ class FileSource:
         self.path, self.on_audio, self.on_status = path, on_audio, on_status or (lambda t, ok: None)
         self.tail_s, self.done = tail_s, done
         self._stop = threading.Event()
+        self.thread: threading.Thread | None = None
         self.active_label = f"文件回放：{Path(path).name}"
         self.stats = {}
 
     def start(self):
-        threading.Thread(target=self._run, name="file-source", daemon=True).start()
+        self.thread = threading.Thread(target=self._run, name="file-source", daemon=True)
+        self.thread.start()
 
     def stop(self):
         self._stop.set()
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join()
 
     def _run(self):
         with wave.open(self.path, "rb") as f:
@@ -239,11 +256,12 @@ class Recorder:
 # ---------------------------------------------------------------- engine
 @dataclasses.dataclass
 class Job:
-    kind: str  # provisional | final
+    kind: str  # provisional | ending (tentative pause) | final
     seq: int
     start: int
     end: int
     speech_end: int | None = None
+    generation: int = 0
 
 
 def choose_cut(words: list[tuple[float, float, str]], total: float, keep_tail: float = 2.0, min_head: float = 3.0):
@@ -277,9 +295,11 @@ class CaptionEngine:
         self.gpu_lock = None
         self._stop = threading.Event()
         self._cancel = threading.Event()
+        self.generation = 0
         self.paused = False
         self.cond = threading.Condition()
         self.worker: threading.Thread | None = None
+        self.draft_pool: ThreadPoolExecutor | None = None
         self.recorder: Recorder | None = None
         self.replay: str | None = None
         self.replay_done = None
@@ -310,7 +330,8 @@ class CaptionEngine:
 
             self._status("loading", "检查 GPU…")
             if self.cfg.get("gpu_lock"):
-                self.gpu_lock = FileLock(str(self.cfg["gpu_lock"]), timeout=0)
+                # Acquired by engine-load and released by the shutdown thread.
+                self.gpu_lock = FileLock(str(self.cfg["gpu_lock"]), timeout=0, thread_local=False)
                 try:
                     self.gpu_lock.acquire()
                 except Timeout:
@@ -367,9 +388,14 @@ class CaptionEngine:
         self.vad.start()
         self.committed: dict[int, int] = {}
         self.parts: dict[int, int] = {}
-        self.shown: dict[str, dict] = {}
+        self.live_id: str | None = None
+        self.mt_key = None
+        self.mt_text = ""
+        self.final_asr = None
+        self.draft_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="draft-mt")
         self.context_hist: collections.deque = collections.deque(maxlen=6)
         self.tick_seq, self.next_tick = -1, 0
+        self.last_preview_end = 0
         self.last_level_emit = 0.0
         self.level_acc = []
         self.worker = threading.Thread(target=self._work, name="caption-worker", daemon=True)
@@ -399,12 +425,16 @@ class CaptionEngine:
             self.capture = None
             if old:
                 old.stop()
+            self.generation += 1
+            self.vad.reset(self.ring.total)
+            self._poke()
             self._open_source()
 
     def pause(self):
         if self.state != "running" or self.paused:
             return
         self.paused = True
+        self.generation += 1
         if self.capture:
             self.capture.stop()
             self.capture = None
@@ -437,6 +467,7 @@ class CaptionEngine:
 
     def _unload(self):
         self._stop.set()
+        self.generation += 1
         self._poke()
         if self.capture:
             self.capture.stop()
@@ -445,8 +476,11 @@ class CaptionEngine:
             self.vad.stop()
             self.vad = None
         if self.worker and self.worker is not threading.current_thread():
-            self.worker.join(timeout=15)
+            self.worker.join()
         self.worker = None
+        if self.draft_pool is not None:
+            self.draft_pool.shutdown(wait=True)
+            self.draft_pool = None
         if self.translator:
             try:
                 if self.cfg.get("stop_owned_server_on_exit", True) or self.translator.name != "qwen":
@@ -489,23 +523,49 @@ class CaptionEngine:
                 return None
             vad = self.vad
             if vad is None or self.paused:
-                self.cond.wait(0.1)
+                self.cond.wait(1.0)
                 return None
             with vad.lock:
                 if vad.finals:
                     f = vad.finals.popleft()
-                    return Job("final", f["seq"], f["start"], f["end"], f["speech_end"])
-                seq, active = vad.seq, vad.active
-            if active is not None:
-                start = max(active, self.committed.get(seq, active))
-                if seq != self.tick_seq:
-                    self.tick_seq, self.next_tick = seq, start + hop
-                now = self.ring.total
-                if now >= self.next_tick and now - start >= SR // 2:
-                    self.next_tick = now + hop
-                    return Job("provisional", seq, start, now)
-            self.cond.wait(0.05)
-            return None
+                    return Job("final", f["seq"], f["start"], f["end"], f["speech_end"], generation=self.generation)
+                seq, active, silence, pos = vad.seq, vad.active, vad.silence, vad.pos
+                last_speech = vad.last_speech
+            if active is None:
+                self.cond.wait(1.0)  # VAD wakes us on speech onset. Timeout services idle release.
+                return None
+            start = max(active, self.committed.get(seq, active), self.ring.base)
+            if seq != self.tick_seq:
+                first = min(hop, int(self.cfg.get("first_update_seconds", 1.4) * SR))
+                self.tick_seq, self.next_tick = seq, start + first
+            now = self.ring.total
+            window_end = start + int(self.cfg["window_seconds"] * SR)
+            end = min(now, window_end)
+            if silence is not None:
+                quiet = pos - silence
+                # While the ASR worker is free, use a likely endpoint to prepare
+                # a draft. It is never committed before VAD confirms the pause.
+                if (vad.preview_silence <= quiet < vad.silence_samples - 512 and
+                        last_speech > self.last_preview_end and start + SR // 2 <= pos <= end):
+                    self.last_preview_end = pos
+                    self.next_tick = max(self.next_tick, min(pos + hop, window_end))
+                    return Job("ending", seq, start, pos, generation=self.generation)
+                self.cond.wait(max(0.032, (vad.silence_samples - quiet) / SR))
+                return None
+            target = max(self.next_tick, start + SR // 2)
+            if now < target:
+                self.cond.wait((target - now) / SR)
+                return None
+            # Advance the first look only. Keep later updates and long-sentence
+            # splits on their regular cadence, without an extra decode at 2 s.
+            self.next_tick = max(now + hop, active + 2 * hop)
+            # If inference fell behind, split from the oldest uncommitted audio.
+            # Sliding the *start* forward can silently discard the first words.
+            self.last_preview_end = end
+            return Job("provisional", seq, start, end, generation=self.generation)
+
+    def _current(self, job: Job) -> bool:
+        return not self.paused and not self._stop.is_set() and job.generation == self.generation
 
     def _work(self):
         while not self._stop.is_set():
@@ -518,6 +578,8 @@ class CaptionEngine:
                     self._final(job)
                 else:
                     self._provisional(job)
+            except CancelledError:
+                continue
             except Exception as exc:
                 log.exception("caption job failed")
                 self.emit({"type": "warning", "text": f"本句处理失败：{exc}"})
@@ -532,11 +594,12 @@ class CaptionEngine:
     def _cid(self, seq: int) -> str:
         return f"{seq}.{self.parts.get(seq, 0)}"
 
-    def _asr(self, audio: np.ndarray):
+    def _asr(self, audio: np.ndarray, *, word_timestamps: bool = True, terms: str | None = None):
         t = time.perf_counter()
-        terms = self.cfg.get("terms", "").strip()
+        if terms is None:
+            terms = self.cfg.get("terms", "").strip()
         segs, _ = self.model.transcribe(audio, language="de", beam_size=self.cfg["beam_size"], temperature=0, condition_on_previous_text=False,
-                                        word_timestamps=True, vad_filter=True, vad_parameters={"min_silence_duration_ms": 300, "speech_pad_ms": 150},
+                                        word_timestamps=word_timestamps, vad_filter=True, vad_parameters={"min_silence_duration_ms": 300, "speech_pad_ms": 150},
                                         initial_prompt=(f"Besprechung. Namen und Begriffe: {terms}." if terms else None))
         kept, words = [], []
         for s in segs:
@@ -547,49 +610,126 @@ class CaptionEngine:
             words += [(w.start, w.end, w.word) for w in (s.words or [])]
         return " ".join(kept).strip(), words, time.perf_counter() - t
 
-    def _translate(self, source: str, cid: str) -> tuple[str, float]:
-        prev = self.shown.get(cid)
-        if prev and prev.get("de") == source and prev.get("zh"):
-            return prev["zh"], 0.0
-        context = " ".join(self.context_hist)
-        r = self.translator.translate(source, context, self.cfg["topic"], self.cfg["terms"], self.cfg["context_chars"])
+    def _translate(self, job: Job, cid: str, source: str, start: int, end: int, superseded=None) -> tuple[str, float]:
+        key = (source, " ".join(self.context_hist), self.cfg["topic"], self.cfg["terms"], self.cfg["context_chars"])
+        if self.mt_key == key:
+            return self.mt_text, 0.0
+
+        def cancelled():
+            return not self._current(job) or (superseded is not None and superseded.is_set())
+
+        def preview(text: str):
+            if not cancelled():
+                self._emit_caption(cid, "provisional", source, text, start, end, streaming=True)
+
+        # Keep an existing readable draft on screen while the next revision is generated.
+        on_partial = preview if self.live_id != cid else None
+        try:
+            r = self.translator.translate(*key, on_partial=on_partial, cancelled=cancelled)
+        except CancelledError:
+            raise
+        except Exception:
+            if on_partial and self._current(job):
+                self.live_id = None
+                self.emit({"type": "drop", "id": cid})
+            raise
+        if r["translation"] and self._current(job):
+            self.mt_key, self.mt_text = key, r["translation"]
         return r["translation"], r["mt_s"]
+
+    def _endpoint_asr(self, start: int, end: int):
+        # The confirmed audio boundaries and recognition settings must match exactly.
+        terms = self.cfg.get("terms", "").strip()
+        key = (start, end, terms, self.cfg["beam_size"])
+        if self.final_asr is None or self.final_asr[0] != key:
+            de, _, seconds = self._asr(self.ring.get(start, end), terms=terms)
+            self.final_asr = (key, de, seconds)
+        return self.final_asr[1:]
+
+    def _translate_draft(self, job: Job, cid: str, de: str, start: int):
+        # At most one MT request in flight. The ASR worker can use a confirmed
+        # pause immediately, even if the last draft's translation is still running.
+        superseded = threading.Event()
+        pending = self.draft_pool.submit(self._translate, job, cid, de, start, job.end, superseded)
+        pending.add_done_callback(lambda _: self._poke())
+        endpoint = None
+        with self.cond:
+            while self._current(job) and not pending.done():
+                with self.vad.lock:
+                    if self.vad.finals and self.vad.finals[0]["seq"] == job.seq:
+                        endpoint = self.vad.finals[0]
+                        break
+                self.cond.wait()
+        try:
+            if endpoint and self._current(job):
+                final_start = max(endpoint["start"], self.committed.get(job.seq, endpoint["start"]))
+                if endpoint["end"] - final_start >= int(0.3 * SR):
+                    final_de, _ = self._endpoint_asr(final_start, endpoint["end"])
+                    if final_de != de:
+                        superseded.set()
+        finally:
+            # Never queue another translation behind a stale request, including on errors.
+            zh, mt_s = pending.result()
+        if superseded.is_set():
+            raise CancelledError()
+        return zh, mt_s
 
     def _emit_caption(self, cid: str, state: str, de: str, zh: str | None, job_start: int, end: int, **extra):
         cap = {"type": "caption", "id": cid, "state": state, "de": de, "zh": zh, "wall_time": time.time() - (time.perf_counter() - self.ring.wall_of(job_start)), **extra}
-        if zh is not None:
-            self.shown[cid] = {"de": de, "zh": zh}
+        if zh:
+            self.live_id = cid if state == "provisional" else None
         self.emit(cap)
         return cap
 
     def _provisional(self, job: Job):
         window = int(self.cfg["window_seconds"] * SR)
-        a = max(job.start, job.end - window)
+        a = job.start
         audio = self.ring.get(a, job.end)
-        de, words, asr_s = self._asr(audio)
-        if self._stop.is_set() or not de:
-            return
         dur = len(audio) / SR
         split_after = self.cfg["window_seconds"] - self.cfg["update_seconds"]
-        if dur >= split_after:
+        ending = job.kind == "ending"
+        de, words, asr_s = self._asr(audio, word_timestamps=ending or dur >= split_after)
+        if not self._current(job):
+            return
+        if not de:
+            if not ending and job.end - a >= window:
+                # A full undecodable window would otherwise be retried forever.
+                # Keep overlap so a word starting at its right edge can be recovered.
+                self.committed[job.seq] = job.end - min(SR, window // 2)
+            return
+        vad = self.vad
+        if vad is None:
+            return
+        if not ending:
+            with vad.lock:
+                if vad.seq != job.seq or vad.active is None:
+                    return
+                if vad.silence is not None and vad.pos - vad.silence >= SR // 5:
+                    self.last_preview_end = a  # allow a fresh endpoint draft
+                    self.next_tick = 0
+                    return
+        if not ending and dur >= split_after:
             cut = choose_cut(words, dur)
             if cut is None and dur >= self.cfg["window_seconds"] - 0.5:
                 cut = (len(words) - 1, words[-1][1]) if words else None
-            if cut is not None:
-                i, t = cut
-                head = "".join(w[2] for w in words[: i + 1]).strip()
+            if cut is not None or job.end - a >= window:
+                head, cut_end = de, job.end
+                if cut is not None:
+                    i, t = cut
+                    if int(t * SR) > 0:
+                        head = "".join(w[2] for w in words[: i + 1]).strip()
+                        cut_end = min(job.end, a + int(t * SR))
                 cid = self._cid(job.seq)
-                with self.cond:
-                    self.committed[job.seq] = a + int(t * SR)
+                if head and self._finalize(job, cid, head, a, cut_end, asr_s, reason="split"):
+                    self.committed[job.seq] = cut_end
                     self.parts[job.seq] = self.parts.get(job.seq, 0) + 1
                     self.next_tick = 0  # recognise the remainder right away
-                if head:
-                    self._finalize(cid, head, a, a + int(t * SR), asr_s, reason="split")
                 return
         cid = self._cid(job.seq)
-        self._emit_caption(cid, "provisional", de, None, a, job.end)
-        zh, mt_s = self._translate(de, cid)
-        if self._stop.is_set():
+        if self.live_id != cid:
+            self._emit_caption(cid, "provisional", de, None, a, job.end)
+        zh, mt_s = self._translate_draft(job, cid, de, a)
+        if not self._current(job):
             return
         lag = time.perf_counter() - self.ring.wall_of(job.end)
         self.prov_lat.append(lag)
@@ -597,20 +737,23 @@ class CaptionEngine:
 
     def _final(self, job: Job):
         cid = self._cid(job.seq)
-        start = max(job.start, self.committed.get(job.seq, job.start))
+        start = max(job.start, self.committed.pop(job.seq, job.start))
+        self.parts.pop(job.seq, None)
         if job.end - start < int(0.3 * SR):
-            if cid in self.shown:
-                self.emit({"type": "drop", "id": cid})
+            self.emit({"type": "drop", "id": cid})
             return
-        audio = self.ring.get(start, job.end)
-        de, _, asr_s = self._asr(audio)
+        de, asr_s = self._endpoint_asr(start, job.end)
+        if not self._current(job):
+            return
         if not de:
             self.emit({"type": "drop", "id": cid})
             return
-        self._finalize(cid, de, start, job.end, asr_s, speech_end=job.speech_end)
+        self._finalize(job, cid, de, start, job.end, asr_s, speech_end=job.speech_end)
 
-    def _finalize(self, cid: str, de: str, start: int, end: int, asr_s: float, speech_end: int | None = None, reason: str = "pause"):
-        zh, mt_s = self._translate(de, cid)
+    def _finalize(self, job: Job, cid: str, de: str, start: int, end: int, asr_s: float, speech_end: int | None = None, reason: str = "pause") -> bool:
+        zh, mt_s = self._translate(job, cid, de, start, end)
+        if not self._current(job):
+            return False
         ref = speech_end if speech_end is not None else end
         lag = time.perf_counter() - self.ring.wall_of(ref)
         cap = self._emit_caption(cid, "final", de, zh, start, end, asr_s=round(asr_s, 3), mt_s=round(mt_s, 3), lag_s=round(lag, 2), reason=reason,
@@ -627,6 +770,7 @@ class CaptionEngine:
         self.emit({"type": "metrics", "count": self.count, "lag_median": float(np.median(self.lat)) if self.lat else None,
                    "prov_lag_median": float(np.median(self.prov_lat)) if self.prov_lat else None, "asr_s": asr_s, "mt_s": mt_s,
                    "record_dir": str(self.recorder.dir) if self.recorder and self.recorder.dir else ""})
+        return True
 
 
 def gpu_memory() -> tuple[int, int]:

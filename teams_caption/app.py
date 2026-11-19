@@ -616,7 +616,7 @@ class ControlWindow(QWidget):
         if m:
             parts.append(f"定稿 {m['count']} 句")
             if m.get("prov_lag_median") is not None:
-                parts.append(f"临时字幕延迟约 {m['prov_lag_median']:.1f} 秒")
+                parts.append(f"临时译文完成中位 {m['prov_lag_median']:.1f} 秒")
             if m.get("lag_median") is not None:
                 parts.append(f"停顿后定稿约 {m['lag_median']:.1f} 秒")
         gpu = getattr(self, "_gpu", None)
