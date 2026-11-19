@@ -1,36 +1,76 @@
-"""Translation back ends (local only).
-
-qwen   – any local OpenAI-compatible chat server (``llm_url`` / ``llm_model``). The author
-         uses Qwen3.8-Flash-Next IQ3_S with thinking disabled. If ``llm_controller`` is set
-         (a .ps1 taking start | stop | status) the server is started on demand and stopped
-         again afterwards; otherwise it must already be running.
-hymt7b – Hy-MT2-7B Q6_K served by llama.cpp ``llama-server`` that this program starts
-         itself (faster and ~11 GB VRAM, but weaker on word sense).
-"""
+"""Streaming caption client and local gateway control. Model ownership stays in the gateway."""
 from __future__ import annotations
 
 import json
+import os
 import re
-import socket
 import subprocess
+import sys
+import threading
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import CancelledError
-from pathlib import Path
+
+from filelock import FileLock
 
 from . import config
 
-NO_WINDOW = subprocess.CREATE_NO_WINDOW
 _LABELS = ("当前语句", "译文", "翻译", "中文")
 _LEAK = re.compile(r"^(?:当前语句|译文|翻译|中文)\s*[:：]\s*")
 
 
-def _http_ok(url: str, timeout: float = 1.0) -> bool:
+def gateway_url(cfg):
+    return f"http://127.0.0.1:{int(cfg.get('gateway_port', 18083))}"
+
+
+def request_json(cfg, path, body=None, timeout=5):
+    data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(gateway_url(cfg) + path, data=data, headers={"Content-Type": "application/json"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(urllib.request.Request(url), timeout=timeout) as r:
-            return r.status == 200
-    except Exception:
-        return False
+        with opener.open(req, timeout=timeout) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        raise RuntimeError(f"翻译网关 HTTP {exc.code} · {detail}") from exc
+
+
+def status(cfg):
+    try:
+        result = request_json(cfg, "/health", timeout=1)
+    except (OSError, ValueError):
+        return None
+    if result.get("service") != "audio-translation":
+        raise RuntimeError("翻译网关端口已被其他服务占用")
+    return result
+
+
+def ensure_gateway(cfg):
+    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(config.DATA_DIR / "gateway-launch.lock"), timeout=20):
+        info = status(cfg)
+        if info:
+            if info["stopping"]:
+                raise RuntimeError("翻译网关正在关闭，请稍后重试")
+            return
+        if (config.DATA_DIR / "model-test.active").exists():
+            raise RuntimeError("本地大模型测试正在使用模型，请先从测试入口停止模型")
+        config.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = config.LOG_DIR / "translation-gateway.log"
+        with log_path.open("ab") as log:
+            process = subprocess.Popen([sys.executable, "-B", "-X", "utf8", "-m", "teams_caption.gateway", "serve"],
+                                       cwd=config.REPO, env={**os.environ, "TEAMS_CAPTION_DATA": str(config.DATA_DIR)},
+                                       stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                       creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP)
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            if status(cfg):
+                return
+            if process.poll() is not None:
+                break
+            time.sleep(.1)
+        raise RuntimeError(f"翻译网关启动失败，详见 {log_path}")
 
 
 def _stream_chat(url: str, body: dict, timeout: float = 30, *, on_partial=None, cancelled=None) -> tuple[str, float, str | None]:
@@ -52,6 +92,8 @@ def _stream_chat(url: str, body: dict, timeout: float = 30, *, on_partial=None, 
                 done = True
                 break
             event = json.loads(payload)
+            if event.get("error"):
+                raise RuntimeError(f"翻译流中断：{event['error']}")
             for c in event.get("choices", []):
                 delta = c.get("delta", {}).get("content")
                 if c.get("finish_reason"):
@@ -79,134 +121,44 @@ def _stream_chat(url: str, body: dict, timeout: float = 30, *, on_partial=None, 
     return text, time.perf_counter() - start, finish
 
 
-class LLMTranslator:
-    name = "qwen"
-
-    def __init__(self, cfg: dict, log):
+class GatewayTranslator:
+    def __init__(self, cfg):
         self.cfg = cfg
-        self.log = log
-        self.owned = False
-        self.url = cfg["llm_url"].rstrip("/")
         self.label = cfg.get("llm_label") or cfg["llm_model"]
+        self.session = None
+        self.closed = threading.Event()
+        self.thread = None
 
-    def ready(self) -> bool:
-        return _http_ok(self.url + "/health") or _http_ok(self.url + "/v1/models")
+    def start(self, progress):
+        progress("连接本地翻译网关…")
+        ensure_gateway(self.cfg)
+        self.session = request_json(self.cfg, "/sessions/open", {})["session"]
+        self.thread = threading.Thread(target=self._heartbeat, name="caption-session", daemon=True)
+        self.thread.start()
 
-    def _control(self, action: str, timeout: float) -> str:
-        script = Path(self.cfg.get("llm_controller") or "")
-        if not script.is_file():
-            raise FileNotFoundError(f"找不到翻译服务启动脚本：{script}")
-        out = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), action],
-                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, creationflags=NO_WINDOW)
-        text = (out.stdout or "") + (out.stderr or "")
-        self.log(f"llm controller {action} -> exit {out.returncode}: {text.strip()[-600:]}")
-        if out.returncode != 0:
-            raise RuntimeError(f"翻译服务 {action} 失败（exit {out.returncode}）：{text.strip()[-300:]}")
-        return text
+    def _heartbeat(self):
+        while not self.closed.wait(10):
+            try:
+                request_json(self.cfg, "/sessions/heartbeat", {"session": self.session})
+            except (OSError, RuntimeError):
+                if self.closed.wait(1):
+                    return
 
-    def start(self, progress) -> None:
-        if self.ready():
-            self.owned = False
-            progress(f"翻译模型 {self.label} 已在运行，直接使用")
-            return
-        if not self.cfg.get("llm_controller"):
-            raise RuntimeError(f"本地翻译服务 {self.url} 没有运行。请先启动它，或在 config.json 里设置 llm_controller 让本程序自动启动。")
-        progress(f"正在启动翻译模型 {self.label}（约 25 秒）…")
+    def stop(self):
+        self.closed.set()
+        if self.thread:
+            self.thread.join(timeout=6)
+        if self.session:
+            request_json(self.cfg, "/sessions/close", {"session": self.session})
+            self.session = None
+
+    def translate(self, source, context, topic, context_chars=160, *, source_language=None, asr_names=(), on_partial=None, cancelled=None):
+        body = {"source": source, "context": context[-context_chars:] if context_chars > 0 else "",
+                "source_language": source_language or self.cfg.get("asr_language", "de"), "topic": topic,
+                "session": self.session, "stream": True, "asr_names": list(asr_names)}
         try:
-            self._control("start", timeout=300)
-            self.owned = True
-            deadline = time.time() + 120
-            while not self.ready():
-                if time.time() > deadline:
-                    raise TimeoutError(f"翻译服务已启动，但 {self.url} 未就绪")
-                time.sleep(0.5)
-        except BaseException:
-            try:
-                self._control("stop", timeout=60)
-            except Exception:
-                pass
-            self.owned = False
-            raise
-
-    def stop(self) -> None:
-        if self.owned:
-            try:
-                self._control("stop", timeout=90)
-            finally:
-                self.owned = False
-
-    def translate(self, source: str, context: str, topic: str, terms: str, context_chars: int = 160, *, on_partial=None, cancelled=None) -> dict:
-        scene = topic.strip() or "Teams 工作会议"
-        system = ("将德语口语译成简体中文，只输出当前语句译文。保留数字、否定、疑问和残句，不补写。"
-                  f"场景是{scene}。只纠正上下文明显支持的识别错词。")
-        if terms.strip():
-            system += f"本句相关术语（德文=指定译法，近音须结合语境）：\n{terms.strip()}"
-        user = ("前文仅供理解：" + context[-context_chars:] + "\n\n" if context else "") + "当前语句：\n" + source
-        body = {"model": self.cfg["llm_model"], "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                "temperature": 0, "max_tokens": 256, "stream": True, "chat_template_kwargs": {"enable_thinking": False}}
-        text, seconds, finish = _stream_chat(self.url + "/v1/chat/completions", body, on_partial=on_partial, cancelled=cancelled)
+            text, seconds, finish = _stream_chat(gateway_url(self.cfg) + "/v1/captions", body, timeout=360,
+                                                 on_partial=on_partial, cancelled=cancelled)
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"翻译网关 HTTP {exc.code} · {exc.read().decode('utf-8', 'replace')}") from exc
         return {"translation": text, "mt_s": seconds, "finish_reason": finish}
-
-
-class HyMT7BTranslator:
-    name = "hymt7b"
-    label = "Hy-MT2-7B（省显存）"
-
-    def __init__(self, cfg: dict, log):
-        self.cfg = cfg
-        self.log = log
-        self.proc: subprocess.Popen | None = None
-        self.port = int(cfg.get("hymt_port") or 18082)
-        self.url = f"http://127.0.0.1:{self.port}"
-
-    def ready(self) -> bool:
-        return _http_ok(self.url + "/health")
-
-    def start(self, progress) -> None:
-        if self.proc and self.proc.poll() is None and self.ready():
-            return
-        with socket.socket() as s:
-            if s.connect_ex(("127.0.0.1", self.port)) == 0:
-                raise RuntimeError(f"端口 {self.port} 已被其他程序占用")
-        server, model = Path(self.cfg.get("llama_server") or ""), Path(self.cfg.get("hymt_model") or "")
-        for p, key in ((server, "llama_server"), (model, "hymt_model")):
-            if not p.is_file():
-                raise FileNotFoundError(f"省显存模式缺少文件（config.json 的 {key}）：{p}")
-        progress("正在加载翻译模型 Hy-MT2-7B…")
-        logf = open(config.LOG_DIR / "llama-hymt7b.log", "w", encoding="utf-8")
-        args = [str(server), "-m", str(model), "--host", "127.0.0.1", "--port", str(self.port),
-                "-ngl", "all", "-c", "4096", "-np", "1", "-fa", "on", "--fit", "off", "--jinja", "--reasoning", "off", "--no-webui"]
-        self.proc = subprocess.Popen(args, stdout=logf, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
-        deadline = time.time() + 120
-        while not self.ready():
-            if self.proc.poll() is not None:
-                raise RuntimeError(f"llama-server 退出（{self.proc.returncode}），见 logs/llama-hymt7b.log")
-            if time.time() > deadline:
-                self.stop()
-                raise TimeoutError("Hy-MT2-7B 加载超时")
-            time.sleep(0.3)
-
-    def stop(self) -> None:
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-        self.proc = None
-
-    def translate(self, source: str, context: str, topic: str, terms: str, context_chars: int = 240, *, on_partial=None, cancelled=None) -> dict:
-        background = f"这是一场{topic.strip() or 'Teams 工作会议'}的德语发言。"
-        if context:
-            background += "\n前文：" + context[-240:]
-        if terms.strip():
-            hints = "\n".join(line.replace("=", " 翻译成 ", 1) for line in terms.splitlines())
-            background += "\n本句的术语请采用以下译法，近音须符合语境。\n" + hints
-        prompt = "[背景信息]\n" + background + "\n\n请结合背景信息将以下文本翻译为简体中文。只输出译文。\n\n[待翻译文本]\n" + source
-        body = {"messages": [{"role": "user", "content": prompt}], "temperature": 0, "top_p": 1, "max_tokens": 512, "stream": True, "seed": 42,
-                "chat_template_kwargs": {"enable_thinking": False}}
-        text, seconds, finish = _stream_chat(self.url + "/v1/chat/completions", body, on_partial=on_partial, cancelled=cancelled)
-        return {"translation": text, "mt_s": seconds, "finish_reason": finish}
-
-
-TRANSLATORS = {"qwen": LLMTranslator, "hymt7b": HyMT7BTranslator}

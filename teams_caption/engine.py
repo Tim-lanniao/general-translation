@@ -236,6 +236,8 @@ class FileSource:
 
 
 def source_spec(key: str) -> SourceSpec:
+    if key == "system":
+        return SourceSpec("system", label="全电脑声音")
     if key in config.APP_SOURCES:
         label, names = config.APP_SOURCES[key]
         return SourceSpec("process", process_names=names, label=label)
@@ -255,9 +257,9 @@ class Recorder:
         if self.dir is None:
             self.dir = config.RECORD_DIR / datetime.now().strftime("%Y-%m-%d_%H%M%S")
             self.dir.mkdir(parents=True, exist_ok=True)
-            head = (f"# Teams 会议字幕 {datetime.now():%Y-%m-%d %H:%M}\n\n"
+            head = (f"# 音频字幕 {datetime.now():%Y-%m-%d %H:%M}\n\n"
                     f"- 声音来源：{self.meta.get('source', '')}\n- 识别：faster-whisper large-v3-turbo；翻译：{self.meta.get('translator', '')}\n"
-                    f"- 机器实时翻译，可能有识别或翻译错误；重要内容请以德语原文/会议录音为准。\n\n")
+                    f"- 机器实时翻译，可能有识别或翻译错误；重要内容请以原文和音频为准。\n\n")
             (self.dir / "字幕.md").write_text(head, encoding="utf-8")
         stamp = datetime.fromtimestamp(cap["wall_time"]).strftime("%H:%M:%S")
         with open(self.dir / "字幕.md", "a", encoding="utf-8") as f:
@@ -304,7 +306,7 @@ def choose_cut(words: list[tuple[float, float, str]], total: float, keep_tail: f
 
 
 class CaptionEngine:
-    """Owns models, threads and the GPU lock. ``emit(event: dict)`` is called from worker threads."""
+    """Owns the ASR model, capture threads and a caption session. ``emit(event: dict)`` is called from worker threads."""
 
     def __init__(self, cfg: dict, emit):
         self.cfg = cfg
@@ -315,9 +317,10 @@ class CaptionEngine:
         self.capture = None
         self.vad: CausalVAD | None = None
         self.ring: AudioRing | None = None
-        self.gpu_lock = None
         self._stop = threading.Event()
         self._cancel = threading.Event()
+        self.loader = None
+        self.shutdown_lock = threading.Lock()
         self.generation = 0
         self.paused = False
         self.cond = threading.Condition()
@@ -345,7 +348,8 @@ class CaptionEngine:
             return
         self._cancel.clear()
         self.state = "loading"
-        threading.Thread(target=self._load_and_run, name="engine-load", daemon=True).start()
+        self.loader = threading.Thread(target=self._load_and_run, name="engine-load", daemon=True)
+        self.loader.start()
 
     def _check_cancel(self):
         if self._cancel.is_set():
@@ -353,21 +357,10 @@ class CaptionEngine:
 
     def _load_and_run(self):
         try:
-            from filelock import FileLock, Timeout
+            from .translate import GatewayTranslator
 
-            self._status("loading", "检查 GPU…")
-            if self.cfg.get("gpu_lock"):
-                # Acquired by engine-load and released by the shutdown thread.
-                self.gpu_lock = FileLock(str(self.cfg["gpu_lock"]), timeout=0, thread_local=False)
-                try:
-                    self.gpu_lock.acquire()
-                except Timeout:
-                    self.gpu_lock = None
-                    raise RuntimeError("GPU 正被其他转写任务占用（共享 GPU 锁）。请停止该任务或等它结束后再开始字幕。")
-            need = 21000 if self.cfg["translator"] == "qwen" else 10000
-            used, total = gpu_memory()
-            if total and total - used < need and not self._translator_already_running():
-                self.emit({"type": "warning", "text": f"显存可能不足：已用 {used/1024:.1f} / {total/1024:.1f} GB，本模式约需 {need/1024:.0f} GB。若加载失败，请关闭其他占用显卡的程序或改用省显存模式。"})
+            self.translator = GatewayTranslator(self.cfg)
+            self.translator.start(lambda text: self._status("loading", text))
             self._check_cancel()
 
             self._status("loading", "加载语音识别模型 large-v3-turbo…")
@@ -383,32 +376,20 @@ class CaptionEngine:
             list(self.model.transcribe((rng.standard_normal(SR * 3) * 0.01).astype(np.float32), language="de", beam_size=self.cfg["beam_size"], temperature=0, vad_filter=False)[0])
             self._check_cancel()
 
-            from .translate import TRANSLATORS
-
-            self.translator = TRANSLATORS[self.cfg["translator"]](self.cfg, log.info)
-            self.translator.start(lambda text: self._status("loading", text))
-            self._check_cancel()
             self._status("loading", "预热翻译模型…")
             greeting = "Hallo zusammen, können Sie mich hören?"
             topic = self.cfg["topic"]
-            self.translator.translate(greeting, "", topic, self.glossary.translation_hints(greeting, topic))
+            self.translator.translate(greeting, "", topic, source_language="de", cancelled=self._cancel.is_set)
             self._check_cancel()
 
             self._start_pipeline()
         except Exception as exc:
             log.exception("start failed")
             self._unload()
-            if isinstance(exc, InterruptedError):
+            if self._cancel.is_set():
                 self._status("idle", "已取消加载")
             else:
                 self._status("error", str(exc))
-
-    def _translator_already_running(self) -> bool:
-        if self.cfg["translator"] == "qwen":
-            from .translate import LLMTranslator
-
-            return LLMTranslator(self.cfg, log.info).ready()
-        return False
 
     def _start_pipeline(self):
         self.ring = AudioRing()
@@ -485,15 +466,13 @@ class CaptionEngine:
     def shutdown(self):
         """Stop everything and free GPU memory (blocking; call from a worker thread)."""
         self._cancel.set()
-        if self.state == "loading":
-            for _ in range(600):  # loading thread cleans up itself
-                if self.state != "loading":
-                    break
-                time.sleep(0.1)
-        if self.state in ("running", "stopping"):
-            self._status("stopping", "正在停止并释放显存…")
-            self._unload()
-            self._status("idle", "已停止，显存已释放")
+        with self.shutdown_lock:
+            if self.loader and self.loader is not threading.current_thread():
+                self.loader.join()
+            if self.state in ("running", "stopping"):
+                self._status("stopping", "正在停止字幕并释放识别显存…")
+                self._unload()
+                self._status("idle", "已停止字幕，识别显存已释放")
 
     def _unload(self):
         self._stop.set()
@@ -511,22 +490,15 @@ class CaptionEngine:
         if self.draft_pool is not None:
             self.draft_pool.shutdown(wait=True)
             self.draft_pool = None
-        if self.translator:
-            try:
-                if self.cfg.get("stop_owned_server_on_exit", True) or self.translator.name != "qwen":
-                    self.translator.stop()
-            except Exception:
-                log.exception("translator stop failed")
-            self.translator = None
         self.model = None
         self.prompt_key = self.prompt = None
         gc.collect()
-        if self.gpu_lock:
+        if self.translator:
             try:
-                self.gpu_lock.release()
+                self.translator.stop()
             except Exception:
-                pass
-            self.gpu_lock = None
+                log.exception("Could not close caption session")
+            self.translator = None
 
     # ---- audio ----------------------------------------------------------------------
     def _on_audio(self, x: np.ndarray):
@@ -629,7 +601,7 @@ class CaptionEngine:
 
     def _recognition_prompt(self):
         glossary = self.glossary
-        if not glossary.entries:
+        if not glossary.entries or self.cfg.get("asr_language", "de") not in ("de", "auto"):
             return None
         topic = self.cfg.get("topic", "")
         recent = self.context_hist[-1] if self.context_hist else ""
@@ -642,7 +614,8 @@ class CaptionEngine:
 
     def _asr(self, audio: np.ndarray, *, word_timestamps: bool, beam_size: int, prompt: str | None, cancelled=None):
         t = time.perf_counter()
-        segs, _ = self.model.transcribe(audio, language="de", beam_size=beam_size, temperature=0, condition_on_previous_text=False,
+        language = self.cfg.get("asr_language", "de")
+        segs, _ = self.model.transcribe(audio, language=None if language == "auto" else language, beam_size=beam_size, temperature=0, condition_on_previous_text=False,
                                         word_timestamps=word_timestamps, vad_filter=True, vad_parameters={"min_silence_duration_ms": 300, "speech_pad_ms": 150},
                                         initial_prompt=prompt)
         kept, words = [], []
@@ -658,7 +631,12 @@ class CaptionEngine:
 
     def _translate(self, job: Job, cid: str, source: str, start: int, end: int, superseded=None) -> tuple[str, float]:
         topic = self.cfg["topic"]
-        key = (source, " ".join(self.context_hist), topic, self.glossary.translation_hints(source, topic), self.cfg["context_chars"])
+        args = (source, " ".join(self.context_hist), topic, self.cfg["context_chars"])
+        language = self.cfg.get("asr_language", "de")
+        aliases = ()
+        if language in ("de", "auto") and self.glossary.entries:
+            aliases = tuple(t.source for t in self.glossary.matches(source, topic, near_only=True))[:12]
+        key = (*args, language, aliases, config.shared_terms_revision())
         if self.mt_key == key:
             return self.mt_text, 0.0
 
@@ -671,7 +649,7 @@ class CaptionEngine:
                 self._emit_caption(cid, "provisional", source, text, start, end, streaming=True)
 
         try:
-            r = self.translator.translate(*key, on_partial=preview, cancelled=cancelled)
+            r = self.translator.translate(*args, asr_names=aliases, on_partial=preview, cancelled=cancelled)
         except CancelledError:
             raise
         except Exception:
@@ -879,8 +857,9 @@ def _cli():
 
     p = argparse.ArgumentParser(description="Headless engine run (file replay or live loopback) for testing.")
     p.add_argument("--replay", help="16 kHz mono WAV, fed at real-time pace")
-    p.add_argument("--source", default=None, help="auto | edge | chrome | device:default")
-    p.add_argument("--translator", default=None, choices=["qwen", "hymt7b"])
+    p.add_argument("--source", default=None, help="system | auto (Teams) | edge | chrome | device:default")
+    p.add_argument("--translator", default=None, choices=["qwen"])
+    p.add_argument("--language", choices=config.LANGUAGES)
     p.add_argument("--seconds", type=float, default=0, help="stop live capture after N seconds")
     p.add_argument("--out", help="write events as JSON lines")
     p.add_argument("--topic", default=None)
@@ -894,6 +873,8 @@ def _cli():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.translator:
         cfg["translator"] = args.translator
+    if args.language:
+        cfg["asr_language"] = args.language
     if args.source:
         cfg["source"] = args.source
     if args.topic is not None:

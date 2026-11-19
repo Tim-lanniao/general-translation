@@ -64,7 +64,8 @@ class Term:
 
 
 class Glossary:
-    def __init__(self, raw: str):
+    def __init__(self, raw: str, *, phonetic=True):
+        self.phonetic = phonetic
         self.raw = raw
         self.entries = []
         self.by_scene = defaultdict(list)
@@ -95,7 +96,7 @@ class Glossary:
                         for alias in (code.groups(), ("".join(code.groups()),)):
                             if alias != words:
                                 self.exact[alias].append(term)
-                    if all(w.isalpha() for w in words):
+                    if phonetic and all(w.isalpha() for w in words):
                         sound = tuple(map(_sound, words))
                         if self.sounds.setdefault(sound, words) != words:
                             self.sounds[sound] = None  # homophones require exact spelling
@@ -106,21 +107,21 @@ class Glossary:
     def _lookup(self, words, sounds):
         entries = self.exact.get(words)
         if entries or not all(w.isalpha() for w in words):
-            return entries
+            return entries, False
         for suffix in ("s", "es", "n", "en", "e"):
             stem = words[-1].removesuffix(suffix)
             if stem != words[-1] and len(stem) >= 5:
                 entries = self.exact.get((*words[:-1], stem))
                 if entries:
-                    return entries
+                    return entries, False
         near = self.sounds.get(sounds)
         if near and all(a == b or SequenceMatcher(None, a, b).ratio() >= 0.7 for a, b in zip(near, words)):
-            return self.exact[near]
-        return None
+            return self.exact[near], True
+        return None, False
 
-    def matches(self, source: str, topic: str) -> list[Term]:
+    def matches(self, source: str, topic: str, *, near_only=False) -> list[Term]:
         words = _words(source)
-        sounds = list(map(_sound, words))
+        sounds = list(map(_sound, words)) if self.phonetic else []
         scene = topic.casefold()
         result = []
         i = 0
@@ -128,7 +129,7 @@ class Glossary:
             for size in self.lengths:
                 if i + size > len(words):
                     continue
-                entries = self._lookup(tuple(words[i:i + size]), tuple(sounds[i:i + size]))
+                entries, near = self._lookup(tuple(words[i:i + size]), tuple(sounds[i:i + size]))
                 if not entries:
                     continue
                 if len(entries) == 1:
@@ -139,7 +140,7 @@ class Glossary:
                     if len({t.target for t in preferred}) > 1:
                         continue
                     term = preferred[0]
-                if term not in result:
+                if (near or not near_only) and term not in result:
                     result.append(term)
                 i += size
                 break
@@ -147,13 +148,16 @@ class Glossary:
                 i += 1
         return result
 
-    def translation_hints(self, source: str, topic: str) -> str:
+    def translation_hints(self, source: str, topic: str, aliases=()) -> str:
         if not self.entries:
             return ""
         hints = []
         length = 0
-        for term in self.matches(source, topic):
+        names = (self.matches(name, topic) for name in aliases)
+        for term in chain(self.matches(source, topic), chain.from_iterable(names)):
             hint = term.hint()
+            if hint in hints:
+                continue
             if length + len(hint) + 1 <= 512:
                 hints.append(hint)
                 length += len(hint) + 1

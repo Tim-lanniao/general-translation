@@ -42,13 +42,10 @@ check("CUDA DLLs (cuBLAS 12 / cuDNN 9)", any((d / "cublas64_12.dll").is_file() f
       "; ".join(map(str, dlls)) or "not configured, relying on PATH")
 check("LLM controller (optional)", Path(cfg["llm_controller"]).is_file() if cfg["llm_controller"] else False,
       cfg["llm_controller"] or f"not set: start {cfg['llm_url']} yourself", required=False)
-check("Hy-MT2-7B mode (optional)", bool(cfg["llama_server"]) and Path(cfg["llama_server"]).is_file() and bool(cfg["hymt_model"]) and Path(cfg["hymt_model"]).is_file(),
-      "llama_server / hymt_model", required=False)
 
 from teams_caption import capture  # noqa: E402
 
 devices = capture.list_render_devices()
 check("Playback devices", bool(devices), "; ".join(d.name + (" (default)" if d.default else "") for d in devices))
-pid = capture.find_root_process(list(config.APP_SOURCES["auto"][1]))
-print(f"[info] Teams process: {pid if pid else 'not running (auto mode falls back to the default playback device)'}")
+print(f"[info] audio source: {cfg['source']} | gateway: 127.0.0.1:{cfg['gateway_port']}")
 sys.exit(0 if ok else 1)

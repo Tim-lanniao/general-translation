@@ -14,6 +14,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 import math
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -298,8 +299,8 @@ class _CompletionHandler:
         return ctypes.addressof(self.obj)
 
 
-def _activate_process_loopback(pid: int):
-    params = ACTIVATION_PARAMS(1, pid, 0)  # PROCESS_LOOPBACK, include target process tree
+def _activate_process_loopback(pid: int, *, exclude=False):
+    params = ACTIVATION_PARAMS(1, pid, int(exclude))  # PROCESS_LOOPBACK_MODE_INCLUDE / EXCLUDE_TARGET_PROCESS_TREE
     pv = PROPVARIANT()
     pv.vt = 65  # VT_BLOB
     pv.u.blob.cbSize = ctypes.sizeof(params)
@@ -403,7 +404,7 @@ def _decoder(fmt: WAVEFORMATEX, ext: WAVEFORMATEXTENSIBLE | None):
 # ---------------------------------------------------------------- capture
 @dataclass
 class SourceSpec:
-    kind: str  # "process" | "device"
+    kind: str  # "system" | "process" | "device"
     process_names: tuple[str, ...] = ()
     device_id: str | None = None  # None = default playback device
     label: str = ""
@@ -441,6 +442,13 @@ class LoopbackCapture:
     def _open(self):
         """Returns (client, label, pid or None)."""
         spec = self.spec
+        if spec.kind == "system":
+            pid = os.getpid()
+            try:
+                return _activate_process_loopback(pid, exclude=True), "全电脑声音（所有播放设备）", pid
+            except OSError:
+                client, name = _activate_device(None)
+                return client, f"系统回环不可用，正在监听默认播放设备 · {name}", None
         if spec.kind == "process":
             pid = spec.pid or find_root_process(list(spec.process_names))
             if pid is not None:

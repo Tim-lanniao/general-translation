@@ -8,6 +8,8 @@ from PySide6.QtCore import QPoint, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QPainter, QPainterPath, QTextLayout, QTextOption
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QToolButton, QWidget
 
+from .config import LANGUAGES
+
 PROVISIONAL = QColor("#F2B544")
 FINAL = QColor("#39D3A0")
 IDLE = QColor("#8792A2")
@@ -54,7 +56,7 @@ class CaptionOverlay(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setMouseTracking(True)
-        self.setWindowTitle("Teams 实时字幕 · 字幕条")
+        self.setWindowTitle("通用音频翻译 · 字幕条")
         self.cfg = cfg
         self.prev_zh = ""
         self.cur_id = None
@@ -75,7 +77,7 @@ class CaptionOverlay(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
         self.buttons = {}
-        for key, text, tip in (("smaller", "A−", "缩小字号（也可 Ctrl+滚轮）"), ("bigger", "A+", "放大字号"), ("german", "德", "显示/隐藏德语原文"),
+        for key, text, tip in (("smaller", "A−", "缩小字号（也可 Ctrl+滚轮）"), ("bigger", "A+", "放大字号"), ("german", "原", "显示/隐藏原文"),
                                ("pause", "⏸", "暂停/继续字幕"), ("console", "☰", "打开控制台"), ("hide", "✕", "隐藏字幕条（控制台可再次显示）")):
             b = QToolButton(self.bar)
             b.setText(text)
@@ -285,7 +287,8 @@ class CaptionOverlay(QWidget):
         p.setBrush(accent)
         p.drawEllipse(QRectF(22, 19, 8, 8))
         p.setPen(QColor(200, 208, 220, 200))
-        p.drawText(QRectF(36, 12, 400, 22), Qt.AlignVCenter | Qt.AlignLeft, "德 → 中 · " + label)
+        source = LANGUAGES.get(self.cfg.get("asr_language", "de"), "原文")
+        p.drawText(QRectF(36, 12, 400, 22), Qt.AlignVCenter | Qt.AlignLeft, f"{source} → 中文 · {label}")
 
         left, right = 34, self.width() - 26
         width = right - left

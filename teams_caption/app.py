@@ -1,4 +1,4 @@
-"""Teams 实时字幕（德语 → 中文）: control window + subtitle bar."""
+"""Control window and floating subtitles for desktop audio translation."""
 from __future__ import annotations
 
 import html
@@ -140,7 +140,7 @@ class ControlWindow(QWidget):
         super().__init__()
         self.cfg = cfg
         self.setObjectName("root")
-        self.setWindowTitle("Teams 实时字幕 · 德语 → 中文")
+        self.setWindowTitle("通用音频翻译 · 实时中文字幕")
         self.setWindowIcon(make_icon())
         self.setStyleSheet(STYLE)
         avail = QApplication.primaryScreen().availableGeometry()
@@ -160,6 +160,7 @@ class ControlWindow(QWidget):
         self.history_text: list[str] = []
         self.record_dir = ""
         self.closing = False
+        config.save_shared_terms(self.cfg.get("terms", ""), initialize=True)
         self._build()
         self.refresh_sources()
         self.set_state("idle", "未启动 · 点击「开始字幕」")
@@ -182,9 +183,9 @@ class ControlWindow(QWidget):
         head = QHBoxLayout()
         titles = QVBoxLayout()
         titles.setSpacing(2)
-        t = QLabel("Teams 实时字幕")
+        t = QLabel("通用音频翻译")
         t.setObjectName("title")
-        s = QLabel("德语 → 简体中文 · 识别与翻译都在本机 GPU 上运行，不上传云端")
+        s = QLabel("实时中文字幕 · 本机 Whisper 识别与 Qwen 翻译")
         s.setObjectName("subtitle")
         titles.addWidget(t)
         titles.addWidget(s)
@@ -209,7 +210,7 @@ class ControlWindow(QWidget):
         self.start_btn = QPushButton("开始字幕")
         self.start_btn.setObjectName("primary")
         self.start_btn.clicked.connect(self.on_primary)
-        self.stop_btn = QPushButton("停止并释放显存")
+        self.stop_btn = QPushButton("停止字幕并释放识别显存")
         self.stop_btn.setObjectName("danger")
         self.stop_btn.clicked.connect(self.stop_engine)
         self.overlay_btn = QPushButton("隐藏字幕条")
@@ -269,25 +270,29 @@ class ControlWindow(QWidget):
         g.addWidget(label("声音来源"), 0, 0)
         g.addLayout(src_row, 0, 1)
 
-        self.translator_box = QComboBox()
-        self.translator_box.addItem(f"高质量 · 本地大模型 {self.cfg.get('llm_label') or self.cfg['llm_model']}（推荐）", "qwen")
-        self.translator_box.addItem("省显存 · Hy-MT2-7B（约 11 GB，更快，词义偶有偏差）", "hymt7b")
-        self.translator_box.setCurrentIndex(max(0, self.translator_box.findData(self.cfg["translator"])))
-        self.translator_box.currentIndexChanged.connect(self.on_translator_changed)
-        g.addWidget(label("翻译模型"), 1, 0)
-        g.addWidget(self.translator_box, 1, 1)
+        self.language_box = QComboBox()
+        for code, name in config.LANGUAGES.items():
+            self.language_box.addItem(name, code)
+        self.language_box.setCurrentIndex(max(0, self.language_box.findData(self.cfg["asr_language"])))
+        self.language_box.currentIndexChanged.connect(lambda _: self.save_setting("asr_language", self.language_box.currentData()))
+        g.addWidget(label("原文语言"), 1, 0)
+        g.addWidget(self.language_box, 1, 1)
 
         self.topic = QLineEdit(self.cfg.get("topic", ""))
         self.topic.setPlaceholderText("例如：模具项目周会 / 供应商技术评审（让翻译理解场景，可随时修改）")
         self.topic.editingFinished.connect(lambda: self.save_setting("topic", self.topic.text().strip()))
-        g.addWidget(label("会议主题"), 2, 0)
+        g.addWidget(label("内容主题"), 2, 0)
         g.addWidget(self.topic, 2, 1)
 
-        self.terms = QPushButton()
-        self.terms.clicked.connect(self.edit_terms)
-        self.refresh_terms_label()
-        g.addWidget(label("人名术语"), 3, 0)
-        g.addWidget(self.terms, 3, 1)
+        self.terms = QPushButton("识别热词…")
+        self.terms.clicked.connect(lambda: self.edit_terms(shared=False))
+        self.shared_terms = QPushButton("共享翻译术语…")
+        self.shared_terms.clicked.connect(lambda: self.edit_terms(shared=True))
+        terms_row = QHBoxLayout()
+        terms_row.addWidget(self.terms)
+        terms_row.addWidget(self.shared_terms)
+        g.addWidget(label("术语"), 3, 0)
+        g.addLayout(terms_row, 3, 1)
 
         look = QHBoxLayout()
         look.setSpacing(10)
@@ -316,15 +321,15 @@ class ControlWindow(QWidget):
         self.auto_start = QCheckBox("打开程序后自动开始")
         self.auto_start.setChecked(self.cfg.get("auto_start", True))
         self.auto_start.toggled.connect(lambda v: self.save_setting("auto_start", v))
-        self.show_de = QCheckBox("字幕条显示德语原文")
+        self.show_de = QCheckBox("字幕条显示原文")
         self.show_de.setChecked(self.cfg.get("show_german", True))
         self.show_de.toggled.connect(self.overlay.set_show_german)
         self.click_through = QCheckBox("字幕条鼠标穿透")
-        self.click_through.setToolTip("开启后，鼠标点击会穿过字幕条落到下方的 Teams 窗口；关闭后才能拖动字幕条")
+        self.click_through.setToolTip("开启后，鼠标点击会穿过字幕条落到下方的窗口；关闭后才能拖动字幕条")
         self.click_through.setChecked(self.cfg.get("click_through", False))
         self.click_through.toggled.connect(self.overlay.set_click_through)
         self.hide_capture = QCheckBox("共享屏幕时对方看不到字幕条")
-        self.hide_capture.setToolTip("字幕条只显示在你自己的屏幕上，Teams 共享屏幕或录屏时会被排除")
+        self.hide_capture.setToolTip("字幕条只显示在你自己的屏幕上，共享屏幕或录屏时会被排除")
         self.hide_capture.setChecked(self.cfg.get("hide_from_capture", True))
         self.hide_capture.toggled.connect(self.overlay.set_hide_from_capture)
         self.auto_fold = QCheckBox("字幕开始后自动收起设置")
@@ -346,7 +351,7 @@ class ControlWindow(QWidget):
         ht = QLabel("字幕记录")
         ht.setStyleSheet("font: 600 14px 'Microsoft YaHei UI';")
         hrow.addWidget(ht)
-        hint = QLabel("最新定稿在最下面；拖动虚线分隔条可调整区域大小")
+        hint = QLabel("最新定稿在下方，拖动分隔线调整高度")
         hint.setObjectName("muted")
         hrow.addWidget(hint)
         hrow.addStretch()
@@ -366,7 +371,7 @@ class ControlWindow(QWidget):
         copy_btn.clicked.connect(self.copy_history)
         folder_btn = QToolButton()
         folder_btn.setObjectName("flat")
-        folder_btn.setText("打开会议记录文件夹")
+        folder_btn.setText("打开字幕记录文件夹")
         folder_btn.clicked.connect(self.open_records)
         for b in (smaller, bigger, copy_btn, folder_btn):
             hrow.addWidget(b)
@@ -405,7 +410,7 @@ class ControlWindow(QWidget):
         self.main_split.setStretchFactor(1, 1)
         root.addWidget(self.main_split, 1)
 
-        foot = QLabel("黄色区域 = 正在说的临时字幕，可能随后修正；说话停顿后定稿，并移到上方记录的最下面。机器翻译可能有误，重要内容请以德语原文为准。")
+        foot = QLabel("黄色区域显示正在翻译的语句。停顿后，定稿会加入上方记录。拖动分隔线可调整两个区域的高度。")
         foot.setObjectName("muted")
         foot.setWordWrap(True)
         root.addWidget(foot)
@@ -437,19 +442,16 @@ class ControlWindow(QWidget):
         self.cfg[key] = value
         config.save(self.cfg)
 
-    def refresh_terms_label(self):
-        count = len(self.engine.glossary.entries)
-        self.terms.setText(f"编辑术语表（{count} 条）" if count else "添加德中术语…")
-
-    def edit_terms(self):
+    def edit_terms(self, *, shared):
         dialog = QDialog(self)
-        dialog.setWindowTitle("德中术语表")
+        dialog.setWindowTitle("共享翻译术语" if shared else "字幕识别热词")
         dialog.resize(580, 440)
         layout = QVBoxLayout(dialog)
-        help_text = QLabel("每行填写 德文=中文。可用 [展会] 等小标题分组，会议主题包含组名时优先用于识别。空标题 [] 切回通用组。")
+        help_text = QLabel("每行填写 原文=译法。字幕和文本翻译都使用这里的词对，每句只加入匹配的条目。"
+                           if shared else "每行填写一个德语人名或术语。用 [展会] 等标题分组，内容主题包含组名时优先识别。")
         help_text.setWordWrap(True)
         layout.addWidget(help_text)
-        editor = QPlainTextEdit(self.cfg.get("terms", ""))
+        editor = QPlainTextEdit(config.read_shared_terms(self.cfg) if shared else self.cfg.get("terms", ""))
         editor.setPlaceholderText("Frau Schäfer=舍费尔女士\n[展会]\nSpritzguss=注塑\nWerkzeugabnahme=模具验收")
         layout.addWidget(editor)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -459,8 +461,11 @@ class ControlWindow(QWidget):
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.save_setting("terms", editor.toPlainText().strip())
-            self.refresh_terms_label()
+            raw = editor.toPlainText().strip()
+            if shared:
+                config.save_shared_terms(raw)
+            else:
+                self.save_setting("terms", raw)
 
     def on_overlay_settings(self, changes: dict):
         for k, v in changes.items():
@@ -480,16 +485,17 @@ class ControlWindow(QWidget):
         self.save_setting("overlay_opacity", v / 100)
 
     def refresh_sources(self):
-        current = self.cfg.get("source", "auto")
+        current = self.cfg.get("source", "system")
         self.source_box.blockSignals(True)
         self.source_box.clear()
+        self.source_box.addItem("全电脑声音（所有播放设备）", "system")
         teams_pid = capture.find_root_process(list(config.APP_SOURCES["auto"][1]))
         found = "，已检测到 Teams" if teams_pid else "，暂未检测到 Teams（先用默认播放设备）"
-        self.source_box.addItem(f"自动：只听 Teams 程序的声音（推荐{found}）", "auto")
-        self.source_box.addItem("网页版 Teams：只听 Edge 浏览器的声音", "edge")
-        self.source_box.addItem("网页版 Teams：只听 Chrome 浏览器的声音", "chrome")
+        self.source_box.addItem(f"Teams 程序{found}", "auto")
+        self.source_box.addItem("只听 Edge 浏览器的声音", "edge")
+        self.source_box.addItem("只听 Chrome 浏览器的声音", "chrome")
         self.source_box.insertSeparator(self.source_box.count())
-        self.source_box.addItem("播放设备：系统默认（会包含电脑上所有声音）", "device:default")
+        self.source_box.addItem("播放设备：仅系统默认播放设备", "device:default")
         try:
             for d in capture.list_render_devices():
                 self.source_box.addItem(f"播放设备：{d.name}{'（当前默认）' if d.default else ''}", "device:" + d.id)
@@ -508,9 +514,6 @@ class ControlWindow(QWidget):
         if key:
             self.save_setting("source", key)
             self.engine.set_source(key)
-
-    def on_translator_changed(self, _):
-        self.save_setting("translator", self.translator_box.currentData())
 
     # ------------------------------------------------------------------ actions
     def on_primary(self):
@@ -538,7 +541,7 @@ class ControlWindow(QWidget):
     def stop_engine(self):
         if self.engine.state in ("idle", "error"):
             return
-        self.set_state("stopping", "正在停止并释放显存…")
+        self.set_state("stopping", "正在停止字幕并释放识别显存…")
         threading.Thread(target=self.engine.shutdown, daemon=True).start()
 
     def toggle_overlay(self):
@@ -579,7 +582,7 @@ class ControlWindow(QWidget):
         self.start_btn.setEnabled(state in ("idle", "error", "running"))
         self.start_btn.setText({"idle": "开始字幕", "error": "重新开始", "loading": "加载中…", "stopping": "停止中…"}.get(state, "继续字幕" if self.engine.paused else "暂停字幕"))
         self.stop_btn.setEnabled(state in ("loading", "running"))
-        self.translator_box.setEnabled(state in ("idle", "error"))
+        self.language_box.setEnabled(state in ("idle", "error"))
         if not loaded:
             self.meter.set(0, False)
             self.speak_label.setText("")
@@ -639,7 +642,7 @@ class ControlWindow(QWidget):
             self.source_label.setText("⚠ " + ev["text"])
         elif t == "idle_release":
             self.stop_engine()
-            self.overlay.set_message(f"超过 {ev['minutes']} 分钟没有人说话，已自动停止并释放显存")
+            self.overlay.set_message(f"超过 {ev['minutes']} 分钟没有人说话，已自动停止字幕并释放识别显存")
 
     def _render_metrics(self):
         parts = []
@@ -658,7 +661,7 @@ class ControlWindow(QWidget):
     def set_live(self, ev: dict | None):
         if not ev:
             self.live_id = None
-            self.live.setHtml("<span style='color:#A89A72'>正在说的内容会实时显示在这里；说话停顿后定稿，并移到上方记录的最下面。</span>")
+            self.live.setHtml("<span style='color:#A89A72'>正在说的内容会显示在这里。停顿后，定稿会加入上方记录。</span>")
             return
         self.live_id = ev["id"]
         zh = ev.get("zh")
@@ -696,14 +699,14 @@ class ControlWindow(QWidget):
             e.accept()
             return
         if self.engine.state in ("running", "loading") and not getattr(self, "skip_confirm", False):
-            ans = QMessageBox.question(self, "退出 Teams 实时字幕", "退出会停止字幕并释放显存。确定退出吗？")
+            ans = QMessageBox.question(self, "退出通用音频翻译", "退出会释放识别显存，翻译模型由网关按需卸载。确定退出吗？")
             if ans != QMessageBox.Yes:
                 e.ignore()
                 return
         e.ignore()
         self.closing = True
         self.overlay.hide()
-        self.set_state("stopping", "正在退出并释放显存…")
+        self.set_state("stopping", "正在退出并释放识别显存…")
         self.setEnabled(False)
 
         def work():
@@ -734,7 +737,7 @@ def main():
     setup_logging()
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
-    app.setApplicationName("Teams 实时字幕")
+    app.setApplicationName("通用音频翻译")
     app.setFont(QFont("Microsoft YaHei UI", 10))
 
     # single instance: a second launch just brings the running window forward
@@ -791,7 +794,7 @@ def run():
         try:
             import traceback
 
-            QMessageBox.critical(None, "Teams 实时字幕出错", traceback.format_exc()[-1500:] + f"\n\n日志：{config.LOG_DIR}")
+            QMessageBox.critical(None, "通用音频翻译出错", traceback.format_exc()[-1500:] + f"\n\n日志：{config.LOG_DIR}")
         except Exception:
             pass
         code = 1

@@ -1,12 +1,10 @@
-import collections
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
-from teams_caption.engine import AudioRing, CaptionEngine, Job, SR
+from teams_caption.gateway import translation_request
 from teams_caption.glossary import Glossary
-from teams_caption.translate import HyMT7BTranslator, LLMTranslator
 
 
 class GlossaryTests(unittest.TestCase):
@@ -46,19 +44,29 @@ class GlossaryTests(unittest.TestCase):
         self.assertEqual(len(hints.splitlines()), 12)
         self.assertLessEqual(len(hints), 512)
 
-    def test_only_current_matches_reach_both_backends(self):
+    def test_phonetic_hotwords_only_help_audio_and_gateway_owns_target(self):
+        source = "Der Blauwahl."
+        local = Glossary("Blauwal=旧译")
+        shared = Glossary("Blauwal=蓝鲸", phonetic=False)
+        names = [t.source for t in local.matches(source, "", near_only=True)]
+        self.assertEqual(names, ["Blauwal"])
+        body = {"source": source, "asr_names": names}
+        for path, expected in (("/v1/captions", True), ("/v1/translate", False)):
+            prompt = translation_request(path, body, {"llm_model": "fake"}, shared)["messages"][0]["content"]
+            self.assertEqual("Blauwal=蓝鲸" in prompt, expected)
+            self.assertNotIn("旧译", prompt)
+
+    def test_only_current_matches_reach_gateway_prompts(self):
         raw = "Presse=压力机\nGX-100=样机\n" + "\n".join(f"Katalog{i}=目录{i}" for i in range(500))
-        for backend in (LLMTranslator, HyMT7BTranslator):
-            with self.subTest(backend=backend), patch("teams_caption.translate._stream_chat", return_value=("压力机", .2, "stop")) as chat:
-                cfg = dict(terms=raw, topic="展会", context_chars=160, llm_url="http://localhost", llm_model="test")
-                eng = CaptionEngine(cfg, Mock())
-                eng.ring = AudioRing(2)
-                eng.context_hist = collections.deque(["GX-100"])
-                eng.mt_key = eng.live_id = None
-                eng.translator = backend(cfg, Mock())
-                job = Job("provisional", 1, 0, SR)
-                eng._translate(job, "1.0", "Die Presse", 0, SR)
-                messages = json.dumps(chat.call_args.args[1]["messages"], ensure_ascii=False)
-                self.assertIn("Presse=压力机" if backend is LLMTranslator else "Presse 翻译成 压力机", messages)
-                self.assertNotIn("样机", messages)
-                self.assertNotIn("Katalog", messages)
+        glossary = Glossary(raw)
+        messages = [{"role": "user", "content": "GX-100"}, {"role": "assistant", "content": "收到"},
+                    {"role": "user", "content": "Die Presse"}]
+        for path, body in (("/v1/captions", {"source": "Die Presse", "context": "GX-100"}),
+                           ("/v1/translate", {"source": "Die Presse"}),
+                           ("/v1/chat/completions", {"messages": messages, "chat_template_kwargs": {"enable_thinking": True}})):
+            payload = translation_request(path, body, {"llm_model": "test"}, glossary)
+            contents = json.dumps(payload["messages"], ensure_ascii=False)
+            self.assertIn("Presse=压力机", contents)
+            self.assertNotIn("样机", contents)
+            self.assertNotIn("Katalog", contents)
+            self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})

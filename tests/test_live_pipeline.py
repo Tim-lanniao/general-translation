@@ -31,6 +31,9 @@ class LiveTranslationTests(unittest.TestCase):
             full, _, _ = _stream_chat(url, {}, on_partial=previews.append)
             self.assertEqual(full, "会议改到周二。")
             self.assertEqual(previews, ["会", "会议改到", "会议改到周二。"])
+            opener.return_value.open.return_value = io.BytesIO(stream + b'data: {"error":"interrupted"}\n\ndata: [DONE]\n')
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                _stream_chat(url, {})
             opener.return_value.open.return_value = io.BytesIO(stream)
             with self.assertRaises(RuntimeError):
                 _stream_chat(url, {})
@@ -47,7 +50,7 @@ class LiveTranslationTests(unittest.TestCase):
         eng.mt_key, eng.mt_text, eng.live_id = None, "", None
         eng.recorder = Mock(dir=None)
         eng.translator = Mock()
-        def translate(source, context, topic, terms, chars, *, on_partial, cancelled):
+        def translate(source, context, topic, chars, *, asr_names, on_partial, cancelled):
             if on_partial:
                 on_partial("会议改到")
             return {"translation": "会议改到周二。", "mt_s": 1.0}
@@ -62,13 +65,14 @@ class LiveTranslationTests(unittest.TestCase):
         cap = eng.recorder.add.call_args.args[0]
         self.assertEqual((cap["state"], cap["zh"], cap["mt_s"]), ("final", "会议改到周二。", 0.0))
         self.assertEqual(sum(e.get("state") == "final" for e in events), 1)
-        # Editing a term while the speaker is talking invalidates the translation.
+        # ASR-only edits do not change MT. A new shared glossary revision does.
         eng.context_hist.clear()
         eng.cfg["terms"] = "Dienstag"
         eng._translate(job, "1.0", de, 0, SR)
-        self.assertEqual(eng.translator.translate.call_count, 2)
-        eng.cfg["terms"] += "\nMesse=展会"
-        eng._translate(job, "1.0", de, 0, SR)
+        eng.translator.translate.assert_called_once()
+        with patch("teams_caption.config.shared_terms_revision", return_value=(1, 1, 1)):
+            eng._translate(job, "1.0", de, 0, SR)
+            eng._translate(job, "1.0", de, 0, SR)
         self.assertEqual(eng.translator.translate.call_count, 2)
 
     def test_packet_resampling_matches_whole_audio(self):
@@ -105,7 +109,7 @@ class LiveTranslationTests(unittest.TestCase):
                     final_ready.set()
                     return de, [], 0.2
                 eng._asr = Mock(side_effect=recognize)
-                def translate(source, *args, on_partial, cancelled):
+                def translate(source, *args, asr_names, on_partial, cancelled):
                     self.assertTrue(final_ready.wait(2), "final ASR was blocked by draft MT")
                     if cancelled():
                         raise CancelledError()
@@ -223,7 +227,7 @@ class LiveTranslationTests(unittest.TestCase):
         eng._asr = Mock(return_value=("Zwanzig.", [], .1))
         self.frames(eng, 0.8, 34)
         self.frames(eng, 0.05)
-        def interrupted(source, *args, on_partial, cancelled):
+        def interrupted(source, *args, asr_names, on_partial, cancelled):
             on_partial("二")
             self.frames(eng, 0.9)
             self.assertTrue(cancelled())
@@ -275,22 +279,27 @@ class LiveTranslationTests(unittest.TestCase):
         self.assertEqual(eng.recorder.add.call_args.args[0]["de"], "Alles richtig? Nein!")
 
     def test_term_edits_during_pause_revalidate_asr_and_mt_independently(self):
-        for edited, expected_asr, expected_mt in (("Presse=压机", 1, 2), ("Presse=压力机\nMesse=展会", 2, 1)):
-            with self.subTest(edited=edited):
+        for change_shared in (True, False):
+            with self.subTest(shared=change_shared), patch("teams_caption.config.shared_terms_revision") as revision:
+                revision.return_value = 1
                 eng = self.make_engine()
-                eng.cfg["terms"] = "Presse=压力机"
+                eng.cfg["terms"] = "Presse"
                 eng.model = Mock()
                 eng.model.hf_tokenizer.encode.return_value = SimpleNamespace(ids=[1])
                 eng._asr = Mock(return_value=("Die Presse.", [], .1))
-                eng.translator.translate.side_effect = lambda de, ctx, topic, terms, *args, **kwargs: dict(translation=terms, mt_s=.2)
+                eng.translator.translate.side_effect = lambda *a, **kw: dict(translation=str(revision.return_value), mt_s=.2)
                 self.frames(eng, 0.8, 34)
                 self.frames(eng, 0.1)
                 eng._provisional(eng._next_job())
-                eng.cfg["terms"] = edited
+                if change_shared:
+                    revision.return_value = 2
+                else:
+                    eng.cfg["terms"] += "\nMesse"
                 self.frames(eng, 0.1, 19)
                 eng._final(eng._next_job())
-                self.assertEqual((eng._asr.call_count, eng.translator.translate.call_count), (expected_asr, expected_mt))
-                self.assertEqual(eng.recorder.add.call_args.args[0]["zh"], edited.splitlines()[0])
+                self.assertEqual(eng._asr.call_count, 1 if change_shared else 2)
+                self.assertEqual(eng.translator.translate.call_count, 2 if change_shared else 1)
+                self.assertEqual(eng.recorder.add.call_args.args[0]["zh"], str(revision.return_value))
 
     def test_only_sentence_end_marks_allow_short_endpoint(self):
         for text in ("Liefern Sie?", "Alles erledigt.“", "Gut!"):
