@@ -18,8 +18,8 @@ config.prepare_environment(CFG)
 from PySide6.QtCore import QObject, QRect, QRectF, Qt, QTimer, Signal  # noqa: E402
 from PySide6.QtGui import QColor, QFont, QIcon, QImage, QLinearGradient, QPainter, QPainterPath, QTextCursor  # noqa: E402
 from PySide6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,  # noqa: E402
-                               QMessageBox, QProgressBar, QPushButton, QSlider, QSplitter, QTextBrowser, QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,  # noqa: E402
+                               QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSplitter, QTextBrowser, QToolButton, QVBoxLayout, QWidget)
 
 from . import capture  # noqa: E402
 from .engine import CaptionEngine, gpu_memory  # noqa: E402
@@ -283,9 +283,9 @@ class ControlWindow(QWidget):
         g.addWidget(label("会议主题"), 2, 0)
         g.addWidget(self.topic, 2, 1)
 
-        self.terms = QLineEdit(self.cfg.get("terms", ""))
-        self.terms.setPlaceholderText("例如：Frau Schäfer, Spritzguss, Werkzeugabnahme（逗号分隔，帮助识别人名和术语）")
-        self.terms.editingFinished.connect(lambda: self.save_setting("terms", self.terms.text().strip()))
+        self.terms = QPushButton()
+        self.terms.clicked.connect(self.edit_terms)
+        self.refresh_terms_label()
         g.addWidget(label("人名术语"), 3, 0)
         g.addWidget(self.terms, 3, 1)
 
@@ -437,6 +437,31 @@ class ControlWindow(QWidget):
         self.cfg[key] = value
         config.save(self.cfg)
 
+    def refresh_terms_label(self):
+        count = len(self.engine.glossary.entries)
+        self.terms.setText(f"编辑术语表（{count} 条）" if count else "添加德中术语…")
+
+    def edit_terms(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("德中术语表")
+        dialog.resize(580, 440)
+        layout = QVBoxLayout(dialog)
+        help_text = QLabel("每行填写 德文=中文。可用 [展会] 等小标题分组，会议主题包含组名时优先用于识别。空标题 [] 切回通用组。")
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+        editor = QPlainTextEdit(self.cfg.get("terms", ""))
+        editor.setPlaceholderText("Frau Schäfer=舍费尔女士\n[展会]\nSpritzguss=注塑\nWerkzeugabnahme=模具验收")
+        layout.addWidget(editor)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.save_setting("terms", editor.toPlainText().strip())
+            self.refresh_terms_label()
+
     def on_overlay_settings(self, changes: dict):
         for k, v in changes.items():
             self.cfg[k] = v
@@ -497,7 +522,6 @@ class ControlWindow(QWidget):
 
     def start_engine(self):
         self.cfg["topic"] = self.topic.text().strip()
-        self.cfg["terms"] = self.terms.text().strip()
         config.save(self.cfg)
         self.overlay.clear()
         self.overlay.set_message("正在加载模型，请稍候…")
@@ -567,6 +591,13 @@ class ControlWindow(QWidget):
             self.speak_label.setText("有人说话" if ev["speaking"] else "")
             self.overlay.set_speaking(ev["speaking"])
         elif t == "caption":
+            # A revision often starts with the exact text already on screen.
+            # Leave those words readable until the first actual correction arrives.
+            if (ev.get("streaming") and ev["id"] == self.overlay.cur_id
+                    and self.overlay.cur_zh.startswith(ev["zh"])):
+                if self.overlay.cur_de == ev["de"]:
+                    return
+                ev = dict(ev, zh=self.overlay.cur_zh)
             self.overlay.show_caption(ev)
             self.on_caption(ev)
         elif t == "drop":

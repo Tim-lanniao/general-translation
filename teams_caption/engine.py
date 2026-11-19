@@ -1,12 +1,9 @@
 """Real-time German -> Chinese caption engine.
 
 Pipeline (parameters from the author's real-time replay evaluation, 2026-11-16):
-  loopback audio 16 kHz mono -> causal Silero VAD (512-sample frames, 600 ms pause
-  ends a sentence) -> first look at 1.4 s, then re-recognise the open sentence
-  on the 2 s cadence (<= 12 s window) with
-  faster-whisper large-v3-turbo (CUDA FP16, beam 5) -> translate -> *replace* the
-  provisional caption. The full uncommitted audio is recognised at the confirmed
-  pause. An exact matching translation can be reused for the final caption.
+  loopback audio 16 kHz mono -> causal Silero VAD -> Whisper Turbo -> streaming
+  translation. Short drafts use beam 1. A pause starts final-quality recognition
+  of the uncommitted speech. Only the same uninterrupted pause can confirm it.
 
 Sentences longer than ~10 s are committed at a sentence/clause boundary taken
 from Whisper word timestamps, so no speech falls out of the 12 s window.
@@ -32,6 +29,7 @@ import numpy as np
 
 from . import config
 from .capture import LoopbackCapture, SourceSpec
+from .glossary import Glossary
 
 SR = 16000
 log = logging.getLogger("teams_caption")
@@ -85,13 +83,13 @@ class AudioRing:
 class CausalVAD:
     """Frame-by-frame Silero VAD with the evaluation's thresholds (start >=.5, pause <.35)."""
 
-    def __init__(self, ring: AudioRing, silence_ms: int, on_change):
+    def __init__(self, ring: AudioRing, silence_ms: int, on_change, punctuated_ms: int = 384):
         from faster_whisper.vad import get_vad_model
 
         self.session = get_vad_model().session
         self.ring = ring
         self.silence_samples = round(silence_ms * 16)
-        self.preview_silence = max(SR // 4, self.silence_samples - int(0.35 * SR))
+        self.punctuated_samples = min(self.silence_samples, max(1, round(punctuated_ms * 16)))
         self.on_change = on_change
         self.lock = threading.Lock()
         self.finals: collections.deque = collections.deque()
@@ -107,6 +105,8 @@ class CausalVAD:
             self.context = np.zeros((1, 64), np.float32)
             self.active: int | None = None
             self.silence: int | None = None
+            self.punctuation_end = -1
+            self.terminal = False
             self.last_commit = position
             self.last_speech = position
             self.seq = getattr(self, "seq", 0)
@@ -125,6 +125,12 @@ class CausalVAD:
     def snapshot(self):
         with self.lock:
             return self.seq, self.active
+
+    def note_transcript(self, seq, end, text):
+        with self.lock:
+            if self.active is not None and self.seq == seq and end >= self.punctuation_end:
+                self.punctuation_end = end
+                self.terminal = sentence_ended(text)
 
     def _run(self):
         while not self._stop.is_set():
@@ -163,17 +169,24 @@ class CausalVAD:
                     self.active = max(self.last_commit, a - 3200)
                     self.seq += 1
                     changed = True
-            elif prob < 0.35 and self.active is not None and self.silence is None:
-                self.silence = a
-            if self.active is not None:
-                quiet = self.silence is not None and end - self.silence >= self.silence_samples
-                if self.silence is not None and a - self.silence < self.preview_silence <= end - self.silence:
+            elif self.active is not None:
+                if prob < 0.35 and self.silence is None:
+                    self.silence = a
                     changed = True
-                if quiet and end - self.active >= SR:
-                    self.finals.append({"seq": self.seq, "start": self.active, "end": end, "speech_end": self.last_speech})
+                elif prob >= 0.35 and self.silence is not None:
+                    self.silence = None  # an uncertain frame invalidates the early decode too
+                    changed = True
+            if self.silence is not None:
+                punctuated = self.terminal and self.punctuation_end >= self.silence
+                threshold = self.punctuated_samples if punctuated else self.silence_samples
+                if end - self.silence >= threshold and end - self.active >= SR:
+                    self.finals.append({"seq": self.seq, "start": self.active, "end": end,
+                                        "speech_end": self.last_speech, "gap": self.silence})
                     self.last_commit = end
                     self.active = None
                     self.silence = None
+                    self.punctuation_end = -1
+                    self.terminal = False
                     changed = True
             self.pos = end
         if changed:
@@ -262,6 +275,16 @@ class Job:
     end: int
     speech_end: int | None = None
     generation: int = 0
+    gap: int | None = None  # first quiet sample, unique within a VAD sequence
+
+
+def sentence_ended(text: str) -> bool:
+    text = text.rstrip().rstrip("\"'»“”’)]").rstrip()
+    if text.endswith(("?", "!")):
+        return True
+    return (text.endswith(".") and not text.endswith(("..", "…."))
+            and not re.search(r"(?:\b\w|\d|\b(?:dr|prof|bzw|usw|ca|nr|inkl|zzgl|ggf|dipl|str|hr|fr"
+                              r"|und|oder|aber|weil|dass|wenn|obwohl|mit|für|zum|zur))\.$", text, re.I))
 
 
 def choose_cut(words: list[tuple[float, float, str]], total: float, keep_tail: float = 2.0, min_head: float = 3.0):
@@ -306,6 +329,10 @@ class CaptionEngine:
         self.lat = collections.deque(maxlen=30)       # pause-final lag (speech end -> final caption)
         self.prov_lat = collections.deque(maxlen=30)  # provisional lag (newest audio -> caption)
         self.count = 0
+        self._terms = Glossary(cfg.get("terms", ""))
+        self.prompt_key, self.prompt = None, None
+        self.candidate = None
+        self.last_attempt = None
 
     # ---- lifecycle -------------------------------------------------------------------
     def _status(self, state: str, text: str):
@@ -362,7 +389,9 @@ class CaptionEngine:
             self.translator.start(lambda text: self._status("loading", text))
             self._check_cancel()
             self._status("loading", "预热翻译模型…")
-            self.translator.translate("Hallo zusammen, können Sie mich hören?", "", self.cfg["topic"], self.cfg["terms"])
+            greeting = "Hallo zusammen, können Sie mich hören?"
+            topic = self.cfg["topic"]
+            self.translator.translate(greeting, "", topic, self.glossary.translation_hints(greeting, topic))
             self._check_cancel()
 
             self._start_pipeline()
@@ -384,7 +413,8 @@ class CaptionEngine:
     def _start_pipeline(self):
         self.ring = AudioRing()
         self._stop.clear()
-        self.vad = CausalVAD(self.ring, self.cfg["vad_final_silence_ms"], self._poke)
+        self.vad = CausalVAD(self.ring, self.cfg["vad_final_silence_ms"], self._poke,
+                             self.cfg.get("vad_punctuated_silence_ms", 384))
         self.vad.start()
         self.committed: dict[int, int] = {}
         self.parts: dict[int, int] = {}
@@ -392,10 +422,10 @@ class CaptionEngine:
         self.mt_key = None
         self.mt_text = ""
         self.final_asr = None
+        self.candidate = self.last_attempt = None
         self.draft_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="draft-mt")
         self.context_hist: collections.deque = collections.deque(maxlen=6)
         self.tick_seq, self.next_tick = -1, 0
-        self.last_preview_end = 0
         self.last_level_emit = 0.0
         self.level_acc = []
         self.worker = threading.Thread(target=self._work, name="caption-worker", daemon=True)
@@ -489,6 +519,7 @@ class CaptionEngine:
                 log.exception("translator stop failed")
             self.translator = None
         self.model = None
+        self.prompt_key = self.prompt = None
         gc.collect()
         if self.gpu_lock:
             try:
@@ -528,9 +559,8 @@ class CaptionEngine:
             with vad.lock:
                 if vad.finals:
                     f = vad.finals.popleft()
-                    return Job("final", f["seq"], f["start"], f["end"], f["speech_end"], generation=self.generation)
+                    return Job("final", f["seq"], f["start"], f["end"], f["speech_end"], self.generation, f.get("gap"))
                 seq, active, silence, pos = vad.seq, vad.active, vad.silence, vad.pos
-                last_speech = vad.last_speech
             if active is None:
                 self.cond.wait(1.0)  # VAD wakes us on speech onset. Timeout services idle release.
                 return None
@@ -542,15 +572,11 @@ class CaptionEngine:
             window_end = start + int(self.cfg["window_seconds"] * SR)
             end = min(now, window_end)
             if silence is not None:
-                quiet = pos - silence
-                # While the ASR worker is free, use a likely endpoint to prepare
-                # a draft. It is never committed before VAD confirms the pause.
-                if (vad.preview_silence <= quiet < vad.silence_samples - 512 and
-                        last_speech > self.last_preview_end and start + SR // 2 <= pos <= end):
-                    self.last_preview_end = pos
-                    self.next_tick = max(self.next_tick, min(pos + hop, window_end))
-                    return Job("ending", seq, start, pos, generation=self.generation)
-                self.cond.wait(max(0.032, (vad.silence_samples - quiet) / SR))
+                attempt = (self.generation, seq, start, silence)
+                if self.last_attempt != attempt and start < pos <= window_end:
+                    self.last_attempt = attempt
+                    return Job("ending", seq, start, pos, generation=self.generation, gap=silence)
+                self.cond.wait(1.0)  # VAD wakes us on resumption or confirmation.
                 return None
             target = max(self.next_tick, start + SR // 2)
             if now < target:
@@ -561,7 +587,6 @@ class CaptionEngine:
             self.next_tick = max(now + hop, active + 2 * hop)
             # If inference fell behind, split from the oldest uncommitted audio.
             # Sliding the *start* forward can silently discard the first words.
-            self.last_preview_end = end
             return Job("provisional", seq, start, end, generation=self.generation)
 
     def _current(self, job: Job) -> bool:
@@ -594,14 +619,35 @@ class CaptionEngine:
     def _cid(self, seq: int) -> str:
         return f"{seq}.{self.parts.get(seq, 0)}"
 
-    def _asr(self, audio: np.ndarray, *, word_timestamps: bool = True, terms: str | None = None):
+    @property
+    def glossary(self):
+        raw = self.cfg.get("terms", "")
+        glossary = self._terms
+        if raw != glossary.raw:
+            glossary = self._terms = Glossary(raw)
+        return glossary
+
+    def _recognition_prompt(self):
+        glossary = self.glossary
+        if not glossary.entries:
+            return None
+        topic = self.cfg.get("topic", "")
+        recent = self.context_hist[-1] if self.context_hist else ""
+        tokenizer = self.model.hf_tokenizer
+        key = (glossary, tokenizer, topic, recent)
+        if key != self.prompt_key:
+            self.prompt = glossary.recognition_prompt(topic, recent, tokenizer)
+            self.prompt_key = key
+        return self.prompt
+
+    def _asr(self, audio: np.ndarray, *, word_timestamps: bool, beam_size: int, prompt: str | None, cancelled=None):
         t = time.perf_counter()
-        if terms is None:
-            terms = self.cfg.get("terms", "").strip()
-        segs, _ = self.model.transcribe(audio, language="de", beam_size=self.cfg["beam_size"], temperature=0, condition_on_previous_text=False,
+        segs, _ = self.model.transcribe(audio, language="de", beam_size=beam_size, temperature=0, condition_on_previous_text=False,
                                         word_timestamps=word_timestamps, vad_filter=True, vad_parameters={"min_silence_duration_ms": 300, "speech_pad_ms": 150},
-                                        initial_prompt=(f"Besprechung. Namen und Begriffe: {terms}." if terms else None))
+                                        initial_prompt=prompt)
         kept, words = [], []
+        if cancelled and cancelled():  # inference is lazy; skip a gap lost during audio preprocessing
+            raise CancelledError()
         for s in segs:
             text = s.text.strip()
             if not text or HALLUCINATION.search(text) or s.compression_ratio > 2.4 or (s.no_speech_prob > 0.6 and s.avg_logprob < -1.0):
@@ -611,40 +657,64 @@ class CaptionEngine:
         return " ".join(kept).strip(), words, time.perf_counter() - t
 
     def _translate(self, job: Job, cid: str, source: str, start: int, end: int, superseded=None) -> tuple[str, float]:
-        key = (source, " ".join(self.context_hist), self.cfg["topic"], self.cfg["terms"], self.cfg["context_chars"])
+        topic = self.cfg["topic"]
+        key = (source, " ".join(self.context_hist), topic, self.glossary.translation_hints(source, topic), self.cfg["context_chars"])
         if self.mt_key == key:
             return self.mt_text, 0.0
 
         def cancelled():
-            return not self._current(job) or (superseded is not None and superseded.is_set())
+            return (not self._current(job) or (superseded is not None and superseded.is_set())
+                    or (job.kind == "ending" and not self._gap_current(job)))
 
         def preview(text: str):
             if not cancelled():
                 self._emit_caption(cid, "provisional", source, text, start, end, streaming=True)
 
-        # Keep an existing readable draft on screen while the next revision is generated.
-        on_partial = preview if self.live_id != cid else None
         try:
-            r = self.translator.translate(*key, on_partial=on_partial, cancelled=cancelled)
+            r = self.translator.translate(*key, on_partial=preview, cancelled=cancelled)
         except CancelledError:
             raise
         except Exception:
-            if on_partial and self._current(job):
+            if self.live_id == cid and self._current(job):
                 self.live_id = None
                 self.emit({"type": "drop", "id": cid})
             raise
-        if r["translation"] and self._current(job):
+        if cancelled():
+            raise CancelledError()
+        if r["translation"]:
             self.mt_key, self.mt_text = key, r["translation"]
         return r["translation"], r["mt_s"]
 
-    def _endpoint_asr(self, start: int, end: int):
-        # The confirmed audio boundaries and recognition settings must match exactly.
-        terms = self.cfg.get("terms", "").strip()
-        key = (start, end, terms, self.cfg["beam_size"])
-        if self.final_asr is None or self.final_asr[0] != key:
-            de, _, seconds = self._asr(self.ring.get(start, end), terms=terms)
-            self.final_asr = (key, de, seconds)
-        return self.final_asr[1:]
+    def _gap_current(self, job: Job):
+        vad = self.vad
+        if job.gap is None or vad is None or not self._current(job):
+            return False
+        with vad.lock:
+            return ((vad.seq == job.seq and vad.active is not None and vad.silence == job.gap)
+                    or any(f["seq"] == job.seq and f.get("gap") == job.gap for f in vad.finals))
+
+    def _endpoint_asr(self, job: Job, start: int):
+        prompt = self._recognition_prompt()
+        beam = self.cfg["beam_size"]
+        key = (job.generation, job.seq, start, job.gap, prompt, beam)
+        if job.gap is not None and self.candidate and self.candidate[0] == key:
+            return self.candidate[1], 0.0
+        full_key = (key, job.end)
+        if self.final_asr and self.final_asr[0] == full_key:
+            return self.final_asr[1], 0.0
+        vad = self.vad
+        cancelled = (lambda: not self._gap_current(job)) if job.kind == "ending" else None
+        de, _, seconds = self._asr(self.ring.get(start, job.end), word_timestamps=False, beam_size=beam,
+                                   prompt=prompt, cancelled=cancelled)
+        if job.kind == "ending":
+            if not self._gap_current(job):
+                raise CancelledError()
+            if de:
+                self.candidate = (key, de)
+                vad.note_transcript(job.seq, job.end, de)
+        else:
+            self.final_asr = (full_key, de)
+        return de, seconds
 
     def _translate_draft(self, job: Job, cid: str, de: str, start: int):
         # At most one MT request in flight. The ASR worker can use a confirmed
@@ -652,21 +722,35 @@ class CaptionEngine:
         superseded = threading.Event()
         pending = self.draft_pool.submit(self._translate, job, cid, de, start, job.end, superseded)
         pending.add_done_callback(lambda _: self._poke())
-        endpoint = None
-        with self.cond:
-            while self._current(job) and not pending.done():
-                with self.vad.lock:
-                    if self.vad.finals and self.vad.finals[0]["seq"] == job.seq:
-                        endpoint = self.vad.finals[0]
-                        break
-                self.cond.wait()
+        checked_gap = job.gap
         try:
-            if endpoint and self._current(job):
-                final_start = max(endpoint["start"], self.committed.get(job.seq, endpoint["start"]))
-                if endpoint["end"] - final_start >= int(0.3 * SR):
-                    final_de, _ = self._endpoint_asr(final_start, endpoint["end"])
-                    if final_de != de:
-                        superseded.set()
+            while True:
+                with self.cond:
+                    vad = self.vad
+                    if vad is None or pending.done() or not self._current(job):
+                        break
+                    with vad.lock:
+                        if vad.finals and vad.finals[0]["seq"] == job.seq:
+                            f = vad.finals[0]
+                            check = Job("final", job.seq, start, f["end"], f["speech_end"], job.generation, f.get("gap"))
+                        elif (vad.seq == job.seq and vad.active is not None and vad.silence is not None
+                              and vad.silence != checked_gap and start < vad.pos <= start + int(self.cfg["window_seconds"] * SR)):
+                            check = Job("ending", job.seq, start, vad.pos, generation=job.generation, gap=vad.silence)
+                            checked_gap = vad.silence
+                        else:
+                            check = None
+                    if check is None:
+                        self.cond.wait()
+                        continue
+                try:
+                    endpoint_de, _ = self._endpoint_asr(check, start)
+                except CancelledError:  # speech resumed while this gap was being decoded
+                    continue
+                if endpoint_de and endpoint_de != de:
+                    superseded.set()
+                    break
+                if check.kind == "final":
+                    break
         finally:
             # Never queue another translation behind a stale request, including on errors.
             zh, mt_s = pending.result()
@@ -684,11 +768,17 @@ class CaptionEngine:
     def _provisional(self, job: Job):
         window = int(self.cfg["window_seconds"] * SR)
         a = job.start
-        audio = self.ring.get(a, job.end)
-        dur = len(audio) / SR
+        dur = (job.end - a) / SR
         split_after = self.cfg["window_seconds"] - self.cfg["update_seconds"]
         ending = job.kind == "ending"
-        de, words, asr_s = self._asr(audio, word_timestamps=ending or dur >= split_after)
+        if ending:
+            de, asr_s = self._endpoint_asr(job, a)
+            words = []
+        else:
+            can_split = dur >= split_after
+            beam = self.cfg["beam_size"] if can_split else 1
+            de, words, asr_s = self._asr(self.ring.get(a, job.end), word_timestamps=can_split,
+                                         beam_size=beam, prompt=self._recognition_prompt())
         if not self._current(job):
             return
         if not de:
@@ -701,12 +791,11 @@ class CaptionEngine:
         if vad is None:
             return
         if not ending:
+            vad.note_transcript(job.seq, job.end, de)
             with vad.lock:
                 if vad.seq != job.seq or vad.active is None:
                     return
-                if vad.silence is not None and vad.pos - vad.silence >= SR // 5:
-                    self.last_preview_end = a  # allow a fresh endpoint draft
-                    self.next_tick = 0
+                if vad.silence is not None and not can_split:
                     return
         if not ending and dur >= split_after:
             cut = choose_cut(words, dur)
@@ -729,7 +818,7 @@ class CaptionEngine:
         if self.live_id != cid:
             self._emit_caption(cid, "provisional", de, None, a, job.end)
         zh, mt_s = self._translate_draft(job, cid, de, a)
-        if not self._current(job):
+        if not self._current(job) or (ending and not self._gap_current(job)):
             return
         lag = time.perf_counter() - self.ring.wall_of(job.end)
         self.prov_lat.append(lag)
@@ -742,7 +831,7 @@ class CaptionEngine:
         if job.end - start < int(0.3 * SR):
             self.emit({"type": "drop", "id": cid})
             return
-        de, asr_s = self._endpoint_asr(start, job.end)
+        de, asr_s = self._endpoint_asr(job, start)
         if not self._current(job):
             return
         if not de:

@@ -11,7 +11,7 @@ import numpy as np
 from scipy.signal import resample_poly
 
 from teams_caption.capture import StreamResampler
-from teams_caption.engine import AudioRing, CaptionEngine, Job, SR
+from teams_caption.engine import AudioRing, CaptionEngine, CausalVAD, Job, SR, sentence_ended
 from teams_caption.translate import _stream_chat
 
 
@@ -22,15 +22,19 @@ class LiveTranslationTests(unittest.TestCase):
             return b"data:" + json.dumps(event).encode() + b"\n\n"
 
         stream = b"".join(data(d) for d in ({"role": "assistant"}, {"reasoning_content": "internal"},
-                                             {"content": "译文："}, {"content": "会议改到"}, {"content": "周二。"}))
+                                             {"content": "译"}, {"content": "文："}, {"content": "会"},
+                                             {"content": "议改到"}, {"content": "周二。"}))
         previews = []
         url = "http://localhost/v1/chat/completions"
         with patch("teams_caption.translate.urllib.request.build_opener") as opener:
             opener.return_value.open.return_value = io.BytesIO(stream + b"data: [DONE]\n")
             full, _, _ = _stream_chat(url, {}, on_partial=previews.append)
             self.assertEqual(full, "会议改到周二。")
-            self.assertEqual(previews[0], "会议改到")
+            self.assertEqual(previews, ["会", "会议改到", "会议改到周二。"])
             opener.return_value.open.return_value = io.BytesIO(stream)
+            with self.assertRaises(RuntimeError):
+                _stream_chat(url, {})
+            opener.return_value.open.return_value = io.BytesIO(stream + b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n')
             with self.assertRaises(RuntimeError):
                 _stream_chat(url, {})
 
@@ -61,6 +65,9 @@ class LiveTranslationTests(unittest.TestCase):
         # Editing a term while the speaker is talking invalidates the translation.
         eng.context_hist.clear()
         eng.cfg["terms"] = "Dienstag"
+        eng._translate(job, "1.0", de, 0, SR)
+        self.assertEqual(eng.translator.translate.call_count, 2)
+        eng.cfg["terms"] += "\nMesse=展会"
         eng._translate(job, "1.0", de, 0, SR)
         self.assertEqual(eng.translator.translate.call_count, 2)
 
@@ -128,21 +135,168 @@ class LiveTranslationTests(unittest.TestCase):
         job = eng._next_job()
         self.assertEqual((job.start, job.end), (SR, 13 * SR))
 
-    def test_brief_pause_never_commits_a_speculative_translation(self):
-        cfg = {"window_seconds": 12, "update_seconds": 2, "terms": ""}
-        events = []
-        eng = CaptionEngine(cfg, events.append)
-        eng.vad = Mock()
-        eng.parts, eng.live_id = {}, None
-        eng.ring = AudioRing(12)
-        eng.ring.append(np.zeros(11 * SR, np.float32))
-        eng._asr = Mock(return_value=("Dienstag.", [(0, 4, "Dienstag."), (5, 10, " Nein.")], 0.2))
-        eng._translate_draft = Mock(return_value=("周二。", 0.7))
-        eng.recorder = Mock()
-        eng._provisional(Job("ending", 2, 0, 11 * SR))
+    def make_engine(self):
+        cfg = dict(window_seconds=12, update_seconds=2, terms="", topic="", context_chars=160, beam_size=5)
+        eng = CaptionEngine(cfg, Mock())
+        eng.parts, eng.committed = {}, {}
+        eng.live_id = eng.mt_key = eng.final_asr = None
+        eng.tick_seq, eng.next_tick = -1, 0
+        eng.context_hist = collections.deque()
+        eng.ring = AudioRing(16)
+        with patch("faster_whisper.vad.get_vad_model") as model:
+            model.return_value.session.run.side_effect = lambda _, args: (args["input"][0, -1:], args["h"], args["c"])
+            eng.vad = CausalVAD(eng.ring, 600, eng._poke)
+        eng.recorder = Mock(dir=None)
+        eng.draft_pool = ThreadPoolExecutor(max_workers=1)
+        self.addCleanup(eng.draft_pool.shutdown)
+        eng.translator = Mock()
+        eng.translator.translate.side_effect = lambda de, *args, **kwargs: dict(translation=de, mt_s=0.3)
+        return eng
+
+    @staticmethod
+    def frames(eng, prob, count=1):
+        frame = np.full(512, prob, np.float32)
+        for _ in range(count):
+            pos = eng.ring.total
+            eng.ring.append(frame)
+            eng.vad._frame(pos, frame.reshape(1, 512))
+
+    def test_first_quiet_frame_starts_final_quality_work_then_reuses_it_once(self):
+        eng = self.make_engine()
+        eng._asr = Mock(return_value=("Ist der Termin am Dienstag?", [], 0.2))
+        self.frames(eng, 0.8, 34)
+        self.frames(eng, 0.1)
+        job = eng._next_job()
+        self.assertEqual((job.kind, job.end - job.gap), ("ending", 512))
+        eng._provisional(job)
+        self.frames(eng, 0.1, 10)
+        self.assertFalse(eng.vad.finals)
         eng.recorder.add.assert_not_called()
-        self.assertTrue(all(e["state"] == "provisional" for e in events))
-        self.assertEqual(eng.count, 0)
+        self.frames(eng, 0.1)
+        final = eng._next_job()
+        self.assertEqual((final.kind, final.end - final.gap), ("final", round(0.384 * SR)))
+        eng._final(final)
+        self.assertEqual(eng.count, 1)
+        self.assertEqual(eng._asr.call_args.kwargs["beam_size"], 5)
+        eng._asr.assert_called_once()
+        eng.translator.translate.assert_called_once()
+
+    def test_resumption_and_uncertain_frames_invalidate_punctuation_and_early_asr(self):
+        for prob in (0.45, 0.9):
+            with self.subTest(prob=prob):
+                eng = self.make_engine()
+                eng._asr = Mock(side_effect=[("Am Dienstag.", [], 0.1), ("Am Dienstag nicht, erst bei 219 Stück", [], 0.1)])
+                self.frames(eng, 0.8, 34)
+                self.frames(eng, 0.1)
+                first = eng._next_job()
+                eng._provisional(first)
+                self.frames(eng, 0.1, 6)
+                self.frames(eng, prob, 3)
+                self.assertFalse(eng._gap_current(first))
+                self.frames(eng, 0.1)
+                tail = eng._next_job()
+                self.assertGreater(tail.gap, first.gap)
+                eng._provisional(tail)
+                self.frames(eng, 0.1, 17)
+                self.assertFalse(eng.vad.finals)
+                self.frames(eng, 0.1)
+                final = eng._next_job()
+                self.assertEqual(final.end - final.gap, 19 * 512)
+                eng._final(final)
+                eng.recorder.add.assert_called_once()
+                self.assertIn("nicht, erst bei 219", eng.recorder.add.call_args.args[0]["de"])
+                self.assertEqual(eng._asr.call_count, 2)
+
+    def test_short_draft_beam_one_and_committed_split_beam_five(self):
+        eng = self.make_engine()
+        self.frames(eng, 0.8, 345)
+        eng._asr = Mock(return_value=("Erster Satz. Weiter.", [(0, 4, "Erster Satz."), (5, 9, " Weiter.")], 0.2))
+        eng._provisional(Job("provisional", 1, 0, 2 * SR))
+        eng.recorder.add.assert_not_called()
+        eng._provisional(Job("provisional", 1, 0, 11 * SR))
+        self.assertEqual([(c.kwargs["beam_size"], c.kwargs["word_timestamps"]) for c in eng._asr.call_args_list],
+                         [(1, False), (5, True)])
+        self.assertEqual(eng.recorder.add.call_args.args[0]["de"], "Erster Satz.")
+
+    def test_speech_during_stream_cancels_preview_and_prevents_cache_write(self):
+        eng = self.make_engine()
+        eng._asr = Mock(return_value=("Zwanzig.", [], .1))
+        self.frames(eng, 0.8, 34)
+        self.frames(eng, 0.05)
+        def interrupted(source, *args, on_partial, cancelled):
+            on_partial("二")
+            self.frames(eng, 0.9)
+            self.assertTrue(cancelled())
+            on_partial("二十。")
+            return {"translation": "二十。", "mt_s": .1}
+        eng.translator.translate.side_effect = interrupted
+        with self.assertRaises(CancelledError):
+            eng._provisional(eng._next_job())
+        shown = [c.args[0]["zh"] for c in eng.emit.call_args_list if c.args[0].get("streaming")]
+        self.assertEqual(shown, ["二"])
+        self.assertIsNone(eng.mt_key)
+        eng.recorder.add.assert_not_called()
+
+    def test_early_decode_overlaps_live_translation_before_pause_confirms(self):
+        eng = self.make_engine()
+        self.frames(eng, .8, 34)
+        draft = Job("provisional", 1, 0, eng.ring.total)
+        decoded = threading.Event()
+        def recognize(audio, **kwargs):
+            self.assertFalse(eng.vad.finals)
+            self.assertEqual(len(audio), draft.end + 512)
+            decoded.set()
+            return "Nein, erst am Freitag.", [], .1
+        eng._asr = Mock(side_effect=recognize)
+        def translate(source, *args, **kwargs):
+            self.frames(eng, .05)
+            self.assertTrue(decoded.wait(2))
+            return {"translation": "周二", "mt_s": .3}
+        eng.translator.translate.side_effect = translate
+        with self.assertRaises(CancelledError):
+            eng._translate_draft(draft, "1.0", "Am Dienstag.", 0)
+        fresh = eng._next_job()
+        self.assertEqual(eng._endpoint_asr(fresh, 0), ("Nein, erst am Freitag.", 0.0))
+        eng._asr.assert_called_once()
+
+    def test_old_punctuation_cannot_confirm_an_unrecognised_tail(self):
+        eng = self.make_engine()
+        self.frames(eng, .8, 34)
+        eng.vad.note_transcript(1, eng.ring.total, "Alles richtig.")
+        self.frames(eng, .1, 3)
+        self.frames(eng, .9, 4)
+        self.frames(eng, .1, 12)
+        self.assertFalse(eng.vad.finals)
+        self.frames(eng, .1, 7)
+        final = eng._next_job()
+        eng._asr = Mock(return_value=("Alles richtig? Nein!", [], .3))
+        eng._final(final)
+        self.assertEqual(len(eng._asr.call_args.args[0]), eng.ring.total)
+        self.assertEqual(eng.recorder.add.call_args.args[0]["de"], "Alles richtig? Nein!")
+
+    def test_term_edits_during_pause_revalidate_asr_and_mt_independently(self):
+        for edited, expected_asr, expected_mt in (("Presse=压机", 1, 2), ("Presse=压力机\nMesse=展会", 2, 1)):
+            with self.subTest(edited=edited):
+                eng = self.make_engine()
+                eng.cfg["terms"] = "Presse=压力机"
+                eng.model = Mock()
+                eng.model.hf_tokenizer.encode.return_value = SimpleNamespace(ids=[1])
+                eng._asr = Mock(return_value=("Die Presse.", [], .1))
+                eng.translator.translate.side_effect = lambda de, ctx, topic, terms, *args, **kwargs: dict(translation=terms, mt_s=.2)
+                self.frames(eng, 0.8, 34)
+                self.frames(eng, 0.1)
+                eng._provisional(eng._next_job())
+                eng.cfg["terms"] = edited
+                self.frames(eng, 0.1, 19)
+                eng._final(eng._next_job())
+                self.assertEqual((eng._asr.call_count, eng.translator.translate.call_count), (expected_asr, expected_mt))
+                self.assertEqual(eng.recorder.add.call_args.args[0]["zh"], edited.splitlines()[0])
+
+    def test_only_sentence_end_marks_allow_short_endpoint(self):
+        for text in ("Liefern Sie?", "Alles erledigt.“", "Gut!"):
+            self.assertTrue(sentence_ended(text))
+        for text in ("Oder", "Mit Dr.", "Das ist z. B.", "Am 19.", "Vielleicht ...", "Lieferbar und."):
+            self.assertFalse(sentence_ended(text))
 
 
 if __name__ == "__main__":

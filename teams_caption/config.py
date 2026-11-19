@@ -32,7 +32,7 @@ DEFAULTS = {
     "source": "auto",            # auto | edge | chrome | device:<id> | device:default | replay:<wav>
     "translator": "qwen",        # qwen = local OpenAI-compatible LLM (recommended) | hymt7b = Hy-MT2-7B via llama.cpp
     "topic": "",                 # meeting subject, used in the translation prompt
-    "terms": "",                 # names / jargon, comma separated
+    "terms": "",                 # German=Chinese lines, optional [scene] sections
     "auto_start": True,
     "show_german": True,
     "font_px": 28,
@@ -50,6 +50,7 @@ DEFAULTS = {
     "update_seconds": 2,
     "first_update_seconds": 1.4, # first draft only; subsequent updates use update_seconds
     "vad_final_silence_ms": 600,
+    "vad_punctuated_silence_ms": 384,
     "beam_size": 5,
     "context_chars": 160,
     # ---- machine-specific paths (set in config.json; see config.example.json)

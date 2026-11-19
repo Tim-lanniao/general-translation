@@ -21,6 +21,7 @@ from pathlib import Path
 from . import config
 
 NO_WINDOW = subprocess.CREATE_NO_WINDOW
+_LABELS = ("当前语句", "译文", "翻译", "中文")
 _LEAK = re.compile(r"^(?:当前语句|译文|翻译|中文)\s*[:：]\s*")
 
 
@@ -36,8 +37,7 @@ def _stream_chat(url: str, body: dict, timeout: float = 30, *, on_partial=None, 
     req = urllib.request.Request(url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"), headers={"Content-Type": "application/json"})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     start = time.perf_counter()
-    next_preview = start
-    parts, finish = [], None
+    raw, shown, finish = "", "", None
     done = False
     if cancelled and cancelled():
         raise CancelledError()
@@ -58,17 +58,24 @@ def _stream_chat(url: str, body: dict, timeout: float = 30, *, on_partial=None, 
                     finish = c["finish_reason"]
                 if not delta:
                     continue
-                parts.append(delta)
-                if on_partial and not finish and time.perf_counter() >= next_preview:
-                    preview = _LEAK.sub("", "".join(parts).strip()).strip()
-                    if len(preview) >= 4 and preview != "当前语句":
+                raw += delta
+                if on_partial:
+                    prefix = raw.strip()
+                    if any(label.startswith(prefix) for label in _LABELS):
+                        continue  # a model may send "译", "文", "：" separately
+                    preview = _LEAK.sub("", prefix).strip()
+                    if preview and preview != shown:
                         on_partial(preview)
-                        next_preview = time.perf_counter() + 0.18
+                        shown = preview
     if not (done or finish):
         raise RuntimeError("本地翻译服务在译文完成前断开了连接")
-    text = _LEAK.sub("", "".join(parts).strip()).strip()
+    if finish and finish != "stop":
+        raise RuntimeError(f"本地翻译服务提前结束了译文（{finish}）")
+    text = _LEAK.sub("", raw.strip()).strip()
     if not text:
         raise RuntimeError("本地翻译服务返回了空译文")
+    if on_partial and text != shown:
+        on_partial(text)
     return text, time.perf_counter() - start, finish
 
 
@@ -133,7 +140,7 @@ class LLMTranslator:
         system = ("将德语口语译成简体中文，只输出当前语句译文。保留数字、否定、疑问和残句，不补写。"
                   f"场景是{scene}。只纠正上下文明显支持的识别错词。")
         if terms.strip():
-            system += f"人名和术语：{terms.strip()}。"
+            system += f"本句相关术语（德文=指定译法，近音须结合语境）：\n{terms.strip()}"
         user = ("前文仅供理解：" + context[-context_chars:] + "\n\n" if context else "") + "当前语句：\n" + source
         body = {"model": self.cfg["llm_model"], "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 "temperature": 0, "max_tokens": 256, "stream": True, "chat_template_kwargs": {"enable_thinking": False}}
@@ -190,10 +197,11 @@ class HyMT7BTranslator:
 
     def translate(self, source: str, context: str, topic: str, terms: str, context_chars: int = 240, *, on_partial=None, cancelled=None) -> dict:
         background = f"这是一场{topic.strip() or 'Teams 工作会议'}的德语发言。"
-        if terms.strip():
-            background += f"\n人名和术语：{terms.strip()}"
         if context:
             background += "\n前文：" + context[-240:]
+        if terms.strip():
+            hints = "\n".join(line.replace("=", " 翻译成 ", 1) for line in terms.splitlines())
+            background += "\n本句的术语请采用以下译法，近音须符合语境。\n" + hints
         prompt = "[背景信息]\n" + background + "\n\n请结合背景信息将以下文本翻译为简体中文。只输出译文。\n\n[待翻译文本]\n" + source
         body = {"messages": [{"role": "user", "content": prompt}], "temperature": 0, "top_p": 1, "max_tokens": 512, "stream": True, "seed": 42,
                 "chat_template_kwargs": {"enable_thinking": False}}
