@@ -1,12 +1,26 @@
 # 文本翻译
 
-文本翻译没有自己的服务，也不导入任何 Python 包。浏览器扩展、划词工具、脚本和局域网里的 Mac 都直接使用[翻译网关](../gateway/README.md)的 OpenAI 兼容接口，和音频翻译共用同一个 Qwen、同一份术语和缓存。字幕总是优先，文本请求在它后面排队。
+文本翻译没有自己的翻译服务。桌面入口、浏览器扩展、划词工具、脚本和局域网里的 Mac 都直接使用[翻译网关](../gateway/README.md)的 OpenAI 兼容接口，和音频翻译共用同一个 Qwen、同一份术语和缓存。字幕总是优先，文本请求排在后面。本目录的程序不导入网关或音频翻译的 Python 包，只调用它们的启动器、命令行和 HTTP 接口。
 
-先在这台电脑上启动网关：
+## 日常入口：通用翻译（`windows\`）
+
+双击 `windows\启动翻译.cmd` 后，默认只进入文本翻译模式：启动网关，预热 Qwen，不加载 Whisper。窗口和托盘图标随即出现。
+
+- **文本翻译**：粘贴或输入原文，按 Ctrl + Enter 或「翻译」，译文逐字出现。原文语言可选自动检测或指定，译成简体中文、德语或英语。空行分隔的段落逐段翻译；译成中文时，后一段带上前一段作为上下文。
+- **模型状态**：窗口顶部显示模型就绪、加载中，或已在空闲时卸载。网关闲置 5 分钟后会卸载 Qwen，下次翻译时自动重新加载，约需 25 秒。
+- **音频翻译**：点「打开音频翻译」才启动[音频翻译](../audio/README.md)：加载 Whisper，开始实时字幕。点「关闭音频翻译」会停止字幕、释放 Whisper，文本翻译不受影响。字幕程序的运行状态以网关上的字幕会话为准。
+- 关闭窗口后程序留在托盘里，右键托盘图标可以退出。退出后网关继续为浏览器扩展等工具服务。再次双击启动器会把已打开的窗口带到前面。
+- 命令行参数：`--open-audio`、`--close-audio`、`--quit` 发给已运行的入口；`--no-warm` 启动时不预热模型。
+
+准备环境（与音频翻译用同一版 Qt）：
 
 ```powershell
-..\gateway\translation-gateway.cmd start
+cd windows
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+入口启动网关时，用 `gateway\translation-gateway.cmd` 选择的 Python；打开音频翻译时，用 `AUDIO_CAPTION_PYTHON` 或 `audio\.venv`。设置和日志保存在数据目录的 `text\`，日志只记录耗时和字数，不记录原文或译文。测试在 `windows\` 目录运行：`.\.venv\Scripts\python.exe -m unittest discover -s tests`。
 
 ## 本机的浏览器扩展和划词工具
 
@@ -49,4 +63,4 @@ curl -s http://<Windows 电脑的 IP>:18083/v1/translate \
 
 ## 以后放在这里
 
-现成工具覆盖不到的部分会放进本目录，同样只通过 HTTP 调网关：`windows\` 放托盘里的快捷键改写和场景切换，`mac\` 放 Hammerspoon 脚本。目前还没有代码。
+快捷键改写输入框和场景切换会加到 `windows\` 的入口里；`mac\` 放 Hammerspoon 脚本。
