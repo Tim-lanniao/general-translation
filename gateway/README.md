@@ -12,7 +12,7 @@
 .\translation-gateway.cmd stop     # 等正在生成的请求结束，卸载托管的模型
 ```
 
-音频翻译启动字幕时会自动拉起网关。只用文本翻译时运行 `start`。`translation-gateway.cmd` 依次使用 `TRANSLATION_GATEWAY_PYTHON`（或旧名 `TEAMS_GATEWAY_PYTHON`）、本目录的 `.venv`、`..\audio\.venv` 里的 Python。单独准备网关环境：
+音频翻译启动字幕时会自动拉起网关。只用文本翻译时运行 `start`。`translation-gateway.cmd` 依次使用 `TRANSLATION_GATEWAY_PYTHON`、本目录的 `.venv`、`..\audio\.venv` 里的 Python；音频翻译自动拉起网关时也先看 `TRANSLATION_GATEWAY_PYTHON`。单独准备网关环境：
 
 ```powershell
 py -3.12 -m venv .venv

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import logging
 import re
@@ -13,8 +14,6 @@ import sqlite3
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from collections import deque
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,6 +34,8 @@ LOCAL = {"localhost", "127.0.0.1", "::1"}
 EXTENSION_SCHEMES = {"chrome-extension", "moz-extension", "safari-web-extension", "extension"}
 LOCAL_ONLY = {"/v1/captions", "/sessions/open", "/sessions/heartbeat", "/sessions/close", "/admin/stop", "/admin/terms"}
 CACHEABLE = {"/v1/translate", "/v1/chat/completions"}
+BODY_LIMIT = 128 * 1024
+TERMS_BODY_LIMIT = 8 * 1024 * 1024
 HEADER_NAME = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
 
@@ -389,7 +390,33 @@ class Server(ThreadingHTTPServer):
 
     def __init__(self, address, state):
         self.state = state
+        if ":" in address[0]:
+            self.address_family = socket.AF_INET6
         super().__init__(address, Handler)
+
+    def server_bind(self):
+        if self.address_family == socket.AF_INET6:
+            # "::" also accepts IPv4 clients; their addresses arrive as ::ffff:a.b.c.d.
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
+def _abort(sock):
+    """Close a socket that another thread is blocked reading from.
+
+    Windows only wakes that read when the handle is closed, and a plain close() waits for the
+    HTTP response's file object, so the handle is detached and closed directly.
+    """
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        socket.socket(fileno=sock.detach()).close()
+    except OSError:
+        pass
 
 
 def _event(line):
@@ -485,29 +512,56 @@ class Handler(BaseHTTPRequestHandler):
         return bool(select.select([self.connection], [], [], 0)[0]) and not self.connection.recv(1, socket.MSG_PEEK)
 
     def _send_cached(self, payload, text):
+        """Replay a cached translation like a fresh one. It used no model tokens."""
         meta = {"id": "chatcmpl-cache-" + secrets.token_hex(8), "created": int(time.time()), "model": payload["model"]}
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         if not payload["stream"]:
-            self._json(200, completion(meta, text, "stop"), {"X-Gateway-Cache": "hit"})
+            self._json(200, completion(meta, text, "stop", usage), {"X-Gateway-Cache": "hit"})
             return
         self._headers(200, "text/event-stream; charset=utf-8", extra={"X-Gateway-Cache": "hit"})
         chunk = dict(meta, object="chat.completion.chunk")
-        for choice in ({"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None},
-                       {"index": 0, "delta": {}, "finish_reason": "stop"}):
-            self.wfile.write(b"data: " + json.dumps(dict(chunk, choices=[choice]), ensure_ascii=False).encode() + b"\n\n")
+        events = [dict(chunk, choices=[{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}]),
+                  dict(chunk, choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}])]
+        options = payload.get("stream_options")
+        if isinstance(options, dict) and options.get("include_usage"):
+            events.append(dict(chunk, choices=[], usage=usage))
+        for event in events:
+            self.wfile.write(b"data: " + json.dumps(event, ensure_ascii=False).encode() + b"\n\n")
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
     def _generate(self, state, payload, marks):
         """Always stream from the model, so a client that goes away also stops its generation.
+        A watcher notices a departed client even while the model has not answered yet.
         Returns (text, finish_reason, complete), or None after the client disconnected."""
         relay = payload["stream"]
-        request = urllib.request.Request(state.runtime.url + "/v1/chat/completions",
-                                         data=json.dumps(dict(payload, stream=True), ensure_ascii=False).encode(),
-                                         headers={"Content-Type": "application/json"})
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        target = urlsplit(state.runtime.url)
+        connection = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
+        conn = connection(target.hostname, target.port, timeout=180)
+        finished, gone = threading.Event(), threading.Event()
+
+        def watch():
+            while not finished.wait(.2):
+                try:
+                    left = self._disconnected()
+                except OSError:
+                    left = True
+                if left:
+                    gone.set()
+                    _abort(conn.sock)
+                    return
+
         parts, finish, done, usage, seen = [], None, False, None, set()
         meta = {"id": "chatcmpl-" + secrets.token_hex(8), "created": int(time.time()), "model": payload["model"]}
-        with opener.open(request, timeout=180) as upstream:
+        try:
+            conn.request("POST", target.path.rstrip("/") + "/v1/chat/completions",
+                         json.dumps(dict(payload, stream=True), ensure_ascii=False).encode(), {"Content-Type": "application/json"})
+            threading.Thread(target=watch, name="client-watch", daemon=True).start()
+            upstream = conn.getresponse()
+            if upstream.status != 200:
+                detail = upstream.read(600).decode("utf-8", "replace")
+                raise ServiceError(upstream.status if 400 <= upstream.status < 600 else 502,
+                                   f"本地翻译服务 HTTP {upstream.status}：{detail}")
             if relay:
                 self._headers(200, "text/event-stream; charset=utf-8", extra={"X-Gateway-Cache": "miss"})
             for line in upstream:
@@ -519,6 +573,9 @@ class Handler(BaseHTTPRequestHandler):
                 event = _event(line)
                 if event == "done":
                     done = True
+                    if relay:  # SSE dispatches an event on the blank line that ends it
+                        self.wfile.write(b"\n")
+                        self.wfile.flush()
                     break
                 if event is None:
                     continue
@@ -538,6 +595,15 @@ class Handler(BaseHTTPRequestHandler):
                         parts.append(delta)
                     if choice.get("finish_reason"):
                         finish = choice["finish_reason"]
+        except OSError:
+            if gone.is_set():
+                return None
+            raise
+        finally:
+            finished.set()
+            conn.close()
+        if gone.is_set():
+            return None
         text = "".join(parts)
         complete = done or finish is not None
         if not relay:
@@ -605,8 +671,9 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", 0))
                 if self.headers.get_content_type() != "application/json":
                     raise ServiceError(415, "需要 application/json")
-                if not 0 < length <= 131072:
-                    raise ServiceError(413, "请求体须在 1 到 131072 字节之间")
+                limit = TERMS_BODY_LIMIT if path == "/admin/terms" else BODY_LIMIT  # a whole glossary is larger than a request
+                if not 0 < length <= limit:
+                    raise ServiceError(413, f"请求体须在 1 到 {limit} 字节之间")
                 body = json.loads(self.rfile.read(length))
                 if not isinstance(body, dict):
                     raise ServiceError(400, "需要 JSON 对象")
@@ -627,7 +694,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
         except Exception as exc:
-            code = exc.code if isinstance(exc, (ServiceError, urllib.error.HTTPError)) else 400 if isinstance(exc, ValueError) else 502
+            code = exc.code if isinstance(exc, ServiceError) else 400 if isinstance(exc, ValueError) else 502
             if not self.sent:
                 self._json(code, {"error": {"message": str(exc)}})
             elif not isinstance(exc, OSError):
@@ -649,7 +716,7 @@ def serve(cfg):
         if cfg.get("llm_controller") and runtime.ready():
             raise RuntimeError("检测到独立运行的 Qwen，请先从测试入口停止模型")
         state = Gateway(cfg, runtime)
-        host = "0.0.0.0" if cfg.get("gateway_lan") else "127.0.0.1"
+        host = ("::" if socket.has_ipv6 else "0.0.0.0") if cfg.get("gateway_lan") else "127.0.0.1"
         if cfg.get("gateway_lan") and not state.devices.count():
             log.warning("已开放局域网访问，但还没有设备 token。运行 translation-gateway.cmd token-add <设备名> 添加。")
         try:

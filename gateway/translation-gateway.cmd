@@ -1,9 +1,8 @@
 @echo off
 setlocal
-rem Python: %TRANSLATION_GATEWAY_PYTHON% (or the older %TEAMS_GATEWAY_PYTHON%) if set,
-rem otherwise .venv in this folder, otherwise the audio app's environment (the gateway only needs filelock).
+rem Python: %TRANSLATION_GATEWAY_PYTHON% if set, otherwise .venv in this folder,
+rem otherwise the audio app's environment (the gateway only needs filelock).
 set "TC_PY=%TRANSLATION_GATEWAY_PYTHON%"
-if "%TC_PY%"=="" set "TC_PY=%TEAMS_GATEWAY_PYTHON%"
 if "%TC_PY%"=="" if exist "%~dp0.venv\Scripts\python.exe" set "TC_PY=%~dp0.venv\Scripts\python.exe"
 if "%TC_PY%"=="" set "TC_PY=%~dp0..\audio\.venv\Scripts\python.exe"
 if not exist "%TC_PY%" (

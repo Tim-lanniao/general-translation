@@ -1,9 +1,8 @@
 @echo off
 setlocal
-rem Python: %AUDIO_CAPTION_PYTHON% (or the older %TEAMS_CAPTION_PYTHON%) if set, otherwise the .venv created by setup.ps1.
+rem Python: %AUDIO_CAPTION_PYTHON% if set, otherwise the .venv created by setup.ps1.
 rem The translation gateway in ..\gateway is found automatically and started on demand.
 set "TC_PY=%AUDIO_CAPTION_PYTHON%"
-if "%TC_PY%"=="" set "TC_PY=%TEAMS_CAPTION_PYTHON%"
 if "%TC_PY%"=="" set "TC_PY=%~dp0.venv\Scripts\pythonw.exe"
 if not exist "%TC_PY%" (
   echo Python environment not found: %TC_PY%

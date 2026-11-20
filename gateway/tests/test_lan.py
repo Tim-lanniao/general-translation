@@ -4,6 +4,7 @@ import http.client
 import io
 import ipaddress
 import json
+import socket
 import threading
 import time
 import unittest
@@ -196,6 +197,52 @@ class LanGatewayTests(unittest.TestCase):
         report = self.state.status_report()
         self.assertEqual(report["clients"]["local"]["text"]["cancelled"], 2)
         self.assertEqual(report["cache"]["entries"], 1)  # only the completed request
+
+    def test_client_that_leaves_before_the_model_answers_frees_the_slot(self):
+        self.start_gateway()
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.model.unblock.clear()
+                self.model.aborted.clear()
+                before = len(self.model.calls)
+                conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+                conn.request("POST", "/v1/translate", body=json.dumps({"source": f"hold slow {stream}", "stream": stream}),
+                             headers={"Content-Type": "application/json"})
+                wait_for(lambda: len(self.model.calls) == before + 1)
+                left = time.monotonic()
+                conn.close()
+                wait_for(lambda: self.state.info()["active"] is None, seconds=2)  # the model is still holding its answer
+                self.assertLess(time.monotonic() - left, 1.5)
+                self.model.unblock.set()
+                self.assertTrue(self.model.aborted.wait(3), "model kept generating for a closed client")
+        self.assertEqual(self.state.status_report()["clients"]["local"]["text"]["cancelled"], 2)
+
+    def test_streams_end_with_a_complete_done_event_and_hits_report_usage(self):
+        self.start_gateway()
+        body = {"source": "Guten Tag", "stream": True, "stream_options": {"include_usage": True}}
+        for expected in ("miss", "hit"):
+            status, headers, data = self.call("POST", "/v1/translate", body)
+            self.assertEqual((status, headers["x-gateway-cache"]), (200, expected))
+            self.assertTrue(data.endswith(b"data: [DONE]\n\n"), data[-40:])
+        events = [json.loads(part[6:]) for part in data.split(b"\n\n") if part.startswith(b"data: {")]
+        self.assertEqual(events[-1]["usage"], {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+        status, headers, data = self.call("POST", "/v1/translate", {"source": "Guten Tag"})
+        self.assertEqual((headers["x-gateway-cache"], json.loads(data)["usage"]["total_tokens"]), ("hit", 0))
+
+    @unittest.skipUnless(socket.has_ipv6, "no IPv6 on this machine")
+    def test_ipv6_listener_also_serves_ipv4_clients(self):
+        # LAN mode listens on "::". Tests stay on loopback addresses: listening on all interfaces
+        # would make Windows ask the user about firewall access.
+        cfg = dict(config.DEFAULTS, gateway_lan=True)
+        state = Gateway(cfg, self.runtime)
+        self.addCleanup(state.close)
+        for listen, connect in (("::ffff:127.0.0.1", "127.0.0.1"), ("::1", "::1")):
+            server = Server((listen, 0), state)
+            self._serve(server)
+            conn = http.client.HTTPConnection(connect, server.server_port, timeout=5)
+            conn.request("GET", "/health")
+            self.assertEqual(conn.getresponse().status, 200, listen)
+            conn.close()
 
     def test_cache_serves_repeats_without_the_model(self):
         self.start_gateway()

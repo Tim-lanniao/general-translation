@@ -46,5 +46,5 @@
 
 | 接口 | 内容 |
 |---|---|
-| `GET /health` | `service`（固定为 `translation-gateway`；旧版网关为 `audio-translation`）、`model`、`loaded`、`active`、`caption_sessions`、`queued_captions`、`queued_text`、`stopping` |
+| `GET /health` | `service`（固定为 `translation-gateway`）、`model`、`loaded`、`active`、`caption_sessions`、`queued_captions`、`queued_text`、`stopping` |
 | `GET /status` | 模型状态（`unloaded`、`loading`、`ready`、`unloading`）、并行数、各队列、术语条数与版本、缓存条数、网络设置，以及每台设备的请求数、缓存命中率、首字与总耗时（P50/P95）。不含任何原文或译文 |
