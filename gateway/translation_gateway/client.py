@@ -27,7 +27,7 @@ _DETACHED = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CR
 
 
 def gateway_url(cfg):
-    return f"http://127.0.0.1:{int(cfg.get('gateway_port', 18083))}"
+    return cfg.get("gateway_url") or f"http://127.0.0.1:{int(cfg.get('gateway_port', 18083))}"
 
 
 def request_json(cfg, path, body=None, timeout=5):
@@ -61,6 +61,12 @@ def _python():
 
 
 def ensure_gateway(cfg):
+    if cfg.get("gateway_url"):
+        # A caller managing its own endpoint must never start another gateway on the local config port.
+        info = status(cfg)
+        if not info or info["stopping"]:
+            raise RuntimeError("指定的翻译网关未就绪，请在翻译入口检查网关状态")
+        return
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     with FileLock(str(config.DATA_DIR / "gateway-launch.lock"), timeout=20):
         info = status(cfg)

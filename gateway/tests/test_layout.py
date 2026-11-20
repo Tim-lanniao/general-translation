@@ -92,6 +92,12 @@ class TermsEndpointTests(unittest.TestCase):
 
 
 class IndependenceTests(unittest.TestCase):
+    def test_unavailable_explicit_endpoint_never_spawns_a_second_gateway(self):
+        with patch.object(client, "status", return_value=None), patch.object(subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(RuntimeError, "指定的翻译网关"):
+                client.ensure_gateway({"gateway_url": "https://localhost:11111"})
+            spawn.assert_not_called()
+
     def test_clients_only_accept_this_gateway_on_the_port(self):
         with patch.object(client, "request_json", return_value={"service": "translation-gateway", "stopping": False}):
             self.assertTrue(client.status({}))

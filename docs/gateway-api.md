@@ -24,7 +24,7 @@
 
 响应与 OpenAI 的 `chat.completion` 相同；`stream: true` 时为 SSE，以 `data: [DONE]` 结束。没有 `[DONE]` 也没有 `finish_reason` 就断开的流是中断的译文，客户端不应当作完整结果。响应头 `X-Gateway-Cache` 为 `hit` 或 `miss`。`finish_reason` 为 `length` 时请缩短原段后重译。
 
-`/v1/translate` 和 `/v1/chat/completions` 的完整译文默认写入磁盘缓存（见网关配置 `gateway_cache`）。请求头带 `Cache-Control: no-store` 时，这次的译文不写入缓存；已有的缓存条目仍可直接返回。桌面入口的普通翻译都带这个请求头。
+`/v1/translate` 和 `/v1/chat/completions` 默认缓存 `temperature=0` 的完整译文。任一 `Cache-Control` 请求头含有 `no-store` 指令时，网关跳过写入，已有缓存仍可命中。缓存写入失败时，客户端照常收到完整响应。桌面入口同时使用接近零的正温度，确保升级后仍在运行的旧网关也会跳过磁盘缓存。
 
 ## 实时会话（仅限本机）
 

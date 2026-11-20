@@ -1,5 +1,6 @@
 """The desk's gateway client, audio control and component boundary, without Qt."""
 import ast
+import http.client
 import json
 import os
 import subprocess
@@ -42,15 +43,31 @@ class FakeGateway(BaseHTTPRequestHandler):
         if "fail" in text:
             self._json(503, {"error": {"message": "GPU 正由其他转写任务使用"}})
             return
+        if "reject" in text:
+            self._json(422, {"error": {"message": "invalid paragraph"}})
+            return
+        if "busy" in text and len(self.server.calls) == 1:
+            self.send_response(429)
+            self.send_header("Retry-After", "0")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if "hold" in text and not self.server.release.wait(5):
             return
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
             self.end_headers()
             words = ["half"] if "half" in text else [] if "empty" in text else self.server.words
             for word in words:
                 self.wfile.write(b"data: " + json.dumps({"choices": [{"delta": {"content": word}}]}).encode() + b"\n\n")
+            if "stall" in text:
+                self.wfile.flush()
+                self.server.release.wait(5)
+            if "truncated" in text:
+                self.wfile.write(b'data: {"choices": [')
+                return
             if "half" in text:
                 return  # the connection closes without a finish reason or [DONE]
             self.wfile.write(b"data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": self.server.finish}]}).encode() + b"\n\n")
@@ -83,11 +100,12 @@ class GatewayClientTests(unittest.TestCase):
         self.assertEqual(partials, ["会议", "会议改到", "会议改到周二。"])  # the model's 「译文：」 label never shows
         path, body, headers = self.server.calls[-1]
         self.assertEqual(path, "/v1/translate")
+        self.assertGreater(body.pop("temperature"), 0)  # older gateways ignore no-store but never cache this
         self.assertEqual(body, {"source": "Der Termin ist am Dienstag.", "source_language": "de", "context": "Vorher.", "stream": True})
         self.assertEqual(headers["Cache-Control"], "no-store")
 
     def test_a_translation_that_breaks_off_is_an_error_not_a_result(self):
-        for source in ("half", "empty"):
+        for source in ("half", "empty", "truncated", "reject"):
             with self.assertRaises(backend.DeskError) as caught:
                 self.gateway.translate(source)
             self.assertTrue(caught.exception.interrupted, source)
@@ -114,6 +132,39 @@ class GatewayClientTests(unittest.TestCase):
         self.assertIn("原文是英语", systems[1])
         self.assertNotIn("原文是", systems[2])
         self.assertEqual(bodies[0]["messages"][1], {"role": "user", "content": "Gift"})
+        self.assertTrue(all(body["temperature"] > 0 for body in bodies))
+
+    def test_busy_paragraph_retries_the_same_request(self):
+        self.assertEqual(self.gateway.translate("busy")[0], "会议改到周二。")
+        self.assertEqual(len(self.server.calls), 2)
+        self.assertEqual(self.server.calls[0], self.server.calls[1])
+
+    def test_https_uses_tls_and_its_default_port(self):
+        # Exercise the HTTP exchange locally while intercepting TLS transport construction.
+        with patch.object(backend.http.client, "HTTPSConnection",
+                          return_value=http.client.HTTPConnection("127.0.0.1", self.server.server_port)) as tls:
+            backend.Gateway("https://example.test/base").translate("Hallo")
+        self.assertEqual(tls.call_args.args, ("example.test", None))
+        self.assertEqual(self.server.calls[-1][0], "/base/v1/translate")
+
+    def test_cancel_while_waiting_for_the_next_event(self):
+        call, partial, cancelled = backend.Call(), threading.Event(), threading.Event()
+
+        def run():
+            try:
+                self.gateway.translate("stall", call=call, on_partial=lambda _: partial.set())
+            except CancelledError:
+                cancelled.set()
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            self.assertTrue(partial.wait(3))
+            call.cancel()
+            self.assertTrue(cancelled.wait(1), "a stalled response still owns the client socket")
+        finally:
+            self.server.release.set()
+            thread.join(3)
 
     def test_cancel_works_while_the_model_has_not_answered(self):
         call, outcome = backend.Call(), {}
@@ -176,6 +227,13 @@ class GatewayClientTests(unittest.TestCase):
             self.assertFalse(gateway.resolved)  # another gateway might answer on the default port
             self.assertEqual(gateway.start(), self.url)
             self.assertTrue(gateway.resolved)
+            self.server.status_body = {"service": "other"}
+            explicit = backend.Gateway(self.url, launcher=launcher)
+            with self.assertRaisesRegex(backend.DeskError, "无法在指定地址确认"):
+                explicit.start()
+            self.assertFalse(explicit.resolved)
+            self.assertFalse(self.server.calls)
+            self.server.status_body = {"service": backend.SERVICE}
             launcher.write_text("@echo off\r\necho Python environment not found: x\r\necho Create one in this folder\r\n"
                                 "exit /b 1\r\n", encoding="ascii")
             with self.assertRaisesRegex(backend.DeskError, "Python environment not found: x Create one in this folder"):
@@ -207,11 +265,12 @@ class HelperTests(unittest.TestCase):
             python.touch()
             audio = backend.Audio(directory=Path(folder), python=str(python))
             with patch("translation_desk.backend.subprocess.Popen") as popen:
-                audio.open()
+                audio.open("http://127.0.0.1:19999")
             args, kwargs = popen.call_args
             self.assertEqual(args[0], [str(python), "-m", "audio_caption", "--start"])
             self.assertEqual((kwargs["cwd"], kwargs["creationflags"]), (Path(folder), backend.DETACHED))
             self.assertEqual(kwargs["env"]["TRANSLATION_DATA"], str(paths.ROOT))
+            self.assertEqual(kwargs["env"]["TRANSLATION_GATEWAY_URL"], "http://127.0.0.1:19999")
             # An app started a moment ago may miss the first quit: ask again until that process has exited.
             audio.process = Mock()
             audio.process.wait.side_effect = [subprocess.TimeoutExpired("x", 1), None]
@@ -230,11 +289,11 @@ class HelperTests(unittest.TestCase):
             backend.Audio(directory=Path(folder), python=str(Path(folder) / "none.exe")).open()
 
     def test_children_get_an_absolute_data_root(self):
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory(prefix="desk test ") as folder:
             env = dict(os.environ, TRANSLATION_DATA="relative-data", PYTHONPATH=str(PACKAGE.parent))
             code = "from translation_desk import backend, paths; print(paths.DATA_DIR); print(backend.child_env()['TRANSLATION_DATA'])"
             out = subprocess.run([sys.executable, "-c", code], cwd=folder, env=env, capture_output=True, text=True, check=True)
-            data_dir, child_root = out.stdout.split()
+            data_dir, child_root = out.stdout.splitlines()
             self.assertEqual(Path(data_dir), Path(folder).resolve() / "relative-data" / "text")
             self.assertEqual(Path(child_root), Path(folder).resolve() / "relative-data")
 

@@ -18,6 +18,7 @@ from collections import deque
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
+from urllib.request import parse_http_list
 
 from filelock import FileLock, Timeout
 
@@ -222,7 +223,7 @@ class Gateway:
 
     def session(self, action, token, caption_state=None):
         """Caption sessions; open and heartbeat may report what the caption app is doing."""
-        if caption_state is not None and caption_state not in CAPTION_STATES:
+        if caption_state is not None and (not isinstance(caption_state, str) or caption_state not in CAPTION_STATES):
             raise ServiceError(400, "state 应为 " + "、".join(sorted(CAPTION_STATES)))
         revision = self.terms()[1]
         with self.cv:
@@ -425,7 +426,9 @@ def _abort(sock):
     except OSError:
         pass
     try:
-        socket.socket(fileno=sock.detach()).close()
+        handle = sock.detach()
+        if handle != -1:
+            socket.close(handle)
     except OSError:
         pass
 
@@ -562,14 +565,17 @@ class Handler(BaseHTTPRequestHandler):
                     left = True
                 if left:
                     gone.set()
-                    _abort(conn.sock)
+                    _abort(upstream_socket)
                     return
 
         parts, finish, done, usage, seen = [], None, False, None, set()
         meta = {"id": "chatcmpl-" + secrets.token_hex(8), "created": int(time.time()), "model": payload["model"]}
+        upstream = None
         try:
             conn.request("POST", target.path.rstrip("/") + "/v1/chat/completions",
                          json.dumps(dict(payload, stream=True), ensure_ascii=False).encode(), {"Content-Type": "application/json"})
+            # getresponse() can transfer a closing connection to the response and clear conn.sock.
+            upstream_socket = conn.sock
             threading.Thread(target=watch, name="client-watch", daemon=True).start()
             upstream = conn.getresponse()
             if upstream.status != 200:
@@ -606,12 +612,14 @@ class Handler(BaseHTTPRequestHandler):
                         parts.append(delta)
                     if choice.get("finish_reason"):
                         finish = choice["finish_reason"]
-        except OSError:
+        except (OSError, http.client.HTTPException):
             if gone.is_set():
                 return None
             raise
         finally:
             finished.set()
+            if upstream is not None:
+                upstream.close()
             conn.close()
         if gone.is_set():
             return None
@@ -648,7 +656,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = state.build(path, body)
             key = cache_key(payload) if state.cache and path in CACHEABLE and payload.get("temperature") == 0 else None
-            cached = state.cache.get(key) if key else None
+            cached = None
+            if key:
+                try:
+                    cached = state.cache.get(key)
+                except (sqlite3.Error, OSError) as exc:
+                    log.warning("Cache lookup failed: %s", type(exc).__name__)
             if cached is not None:
                 outcome = "hit"
                 record()  # bookkeeping first: a client holding the answer also finds it counted
@@ -667,9 +680,13 @@ class Handler(BaseHTTPRequestHandler):
             text, finish, complete, reply = result
             outcome = "ok" if complete and finish in (None, "stop") else "error"
             # "Cache-Control: no-store" keeps this translation off the disk; cached answers may still serve it.
-            store = "no-store" not in self.headers.get("Cache-Control", "").lower()
+            directives = parse_http_list(",".join(self.headers.get_all("Cache-Control", [])))
+            store = all(item.partition("=")[0].strip().lower() != "no-store" for item in directives)
             if key and store and outcome == "ok" and text.strip():
-                state.cache.put(key, text, payload["model"])
+                try:
+                    state.cache.put(key, text, payload["model"])
+                except (sqlite3.Error, OSError) as exc:
+                    log.warning("Cache write failed: %s", type(exc).__name__)
             record()
             reply()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):

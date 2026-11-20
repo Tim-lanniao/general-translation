@@ -33,6 +33,7 @@ def wait_until(condition, seconds=5):
 class FakeGateway:
     url = "http://127.0.0.1:18083"
     resolved = True
+    explicit = True
 
     def __init__(self):
         self.sessions, self.caption_states = 0, {}
@@ -67,8 +68,12 @@ class FakeAudio:
     def __init__(self):
         self.opened = self.closed = 0
 
-    def open(self):
+    def open(self, gateway_url):
         self.opened += 1
+        self.url = gateway_url
+
+    def open_error(self):
+        return ""
 
     def close(self):
         self.closed += 1
@@ -85,6 +90,7 @@ class DeskWindowTests(unittest.TestCase):
         self.gateway, self.audio = FakeGateway(), FakeAudio()
         self.window = desk.DeskWindow(self.gateway, self.audio, dict(paths.DEFAULTS))
         self.addCleanup(self.window.deleteLater)
+        self.addCleanup(self.window.audio_worker.shutdown)
         self.addCleanup(self.window.poll_timer.stop)
 
     def refresh(self):
@@ -138,6 +144,17 @@ class DeskWindowTests(unittest.TestCase):
         self.assertEqual(len(self.gateway.calls), 1)
         self.assertIn("〔第 1 段起没有翻译", self.window.output.toPlainText())
 
+    def test_partial_translation_survives_an_incomplete_event(self):
+        def translate(text, source, target, *, on_partial, **kwargs):
+            if text == "first":
+                on_partial("第一")
+                raise backend.DeskError("不完整的流事件", interrupted=True)
+            return "第二段", "stop"
+
+        with patch.object(self.gateway, "translate", translate):
+            self.translate("first\n\nsecond")
+        self.assertEqual(self.window.output.toPlainText(), "第一〔第 1 段翻译中断：不完整的流事件〕\n\n第二段")
+
     def test_a_new_translation_cancels_the_one_still_waiting(self):
         waiting = threading.Event()
 
@@ -161,6 +178,7 @@ class DeskWindowTests(unittest.TestCase):
     def test_audio_states_follow_the_caption_session(self):
         self.window.audio_button.click()
         wait_until(lambda: self.audio.opened == 1)
+        self.assertEqual(self.audio.url, self.gateway.url)
         self.assertEqual(self.window.audio_label.text(), "正在打开音频翻译，加载 Whisper…")
         self.gateway.sessions, self.gateway.caption_states = 1, {"loading": 1}  # session open, Whisper still loading
         self.refresh()
@@ -188,6 +206,41 @@ class DeskWindowTests(unittest.TestCase):
         self.refresh()
         self.assertEqual(self.window.audio_button.text(), "打开音频翻译")
         self.assertIn("没有开始字幕", self.window.audio_hint.text())
+
+    def test_open_resumes_paused_and_stale_loading_expires(self):
+        wait_until(self.gateway.started.is_set)
+        self.gateway.sessions, self.gateway.caption_states = 1, {"paused": 1}
+        self.refresh()
+        self.window.handle_command(b"open-audio")
+        wait_until(lambda: self.audio.opened == 1 and not self.window.audio_busy)
+        self.assertIsNotNone(self.window.audio_pending)
+        self.gateway.caption_states = {"loading": 1}
+        self.refresh()
+        self.window.audio_pending = ("opening", time.monotonic() - 1)
+        self.gateway.reachable = False
+        for _ in range(desk.STATUS_MISSES):
+            self.refresh()
+        self.assertIsNone(self.window.audio_pending)
+        self.assertIn("没有开始字幕", self.window.audio_hint.text())
+
+    def test_quit_drains_audio_commands_in_order(self):
+        entered, release, actions = threading.Event(), threading.Event(), []
+
+        def opening(url):
+            entered.set()
+            release.wait(3)
+            actions.append("open")
+
+        with patch.object(self.audio, "open", opening), patch.object(self.audio, "close", lambda: actions.append("close")), \
+                patch.object(desk.QApplication, "quit") as quit_app:
+            self.window.open_audio()
+            wait_until(entered.is_set)
+            self.window.close_audio()
+            self.window.quit_now()
+            quit_app.assert_not_called()
+            release.set()
+            wait_until(lambda: quit_app.called)
+            self.assertEqual(actions, ["open", "close"])
 
 
 if __name__ == "__main__":

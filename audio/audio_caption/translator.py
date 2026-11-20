@@ -1,6 +1,7 @@
 """Caption client of the translation gateway: a session with priority, streamed sentences."""
 from __future__ import annotations
 
+import os
 import threading
 import urllib.error
 
@@ -8,10 +9,18 @@ from translation_gateway import client
 from translation_gateway import config as gateway_config
 
 
+def gateway_settings():
+    cfg = gateway_config.load()
+    url = os.environ.get("TRANSLATION_GATEWAY_URL")
+    if url:
+        cfg = dict(cfg, gateway_url=url.rstrip("/"))
+    return cfg
+
+
 class GatewayTranslator:
     def __init__(self, cfg, gateway_cfg=None):
         self.cfg = cfg
-        self.gateway_cfg = gateway_cfg if gateway_cfg is not None else gateway_config.load()
+        self.gateway_cfg = gateway_cfg if gateway_cfg is not None else gateway_settings()
         self.label = self.gateway_cfg.get("llm_label") or self.gateway_cfg["llm_model"]
         self.session = None
         self.state = "loading"      # what this session tells the gateway the caption app is doing
@@ -70,12 +79,12 @@ class GatewayTranslator:
 
 def read_shared_terms():
     """The gateway's glossary, starting the gateway if needed (it does not load the model)."""
-    cfg = gateway_config.load()
+    cfg = gateway_settings()
     client.ensure_gateway(cfg)
     return client.request_json(cfg, "/admin/terms")
 
 
 def save_shared_terms(raw: str):
-    cfg = gateway_config.load()
+    cfg = gateway_settings()
     client.ensure_gateway(cfg)
     return client.request_json(cfg, "/admin/terms", {"terms": raw})

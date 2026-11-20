@@ -16,6 +16,7 @@ import time
 import urllib.request
 from concurrent.futures import CancelledError
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -27,6 +28,9 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 # The desk's own translations are not kept in the gateway's disk cache (docs/gateway-api.md).
 REQUEST_HEADERS = {"Content-Type": "application/json", "Cache-Control": "no-store"}
+# Gateways already running before no-store support cache only temperature=0. A near-greedy
+# request also stays private on those processes, even if the gateway restarts between calls.
+DESK_TEMPERATURE = 0.000001
 
 SOURCES = {"auto": "自动检测", "de": "德语", "en": "英语", "ja": "日语", "fr": "法语", "es": "西班牙语"}
 TARGETS = {"zh": "简体中文", "de": "德语", "en": "英语"}
@@ -43,10 +47,12 @@ class DeskError(RuntimeError):
     """A failure the window shows in full. The log gets only ``stage`` and ``status``,
     because a message from the model server may quote the text being translated."""
 
-    def __init__(self, message: str, *, stage: str = "desk", status: int | None = None, interrupted: bool = False):
+    def __init__(self, message: str, *, stage: str = "desk", status: int | None = None, interrupted: bool = False,
+                 retry_after: float | None = None):
         super().__init__(message)
         # interrupted: the answer broke off mid-way; the next paragraph may still work
         self.stage, self.status, self.interrupted = stage, status, interrupted
+        self.retry_after = retry_after
 
     def log_line(self) -> str:
         return f"{self.stage} failed" + (f" (HTTP {self.status})" if self.status else "")
@@ -134,7 +140,9 @@ def _abort(sock) -> None:
     except OSError:
         pass
     try:
-        socket.socket(fileno=sock.detach()).close()
+        handle = sock.detach()
+        if handle != -1:
+            socket.close(handle)
     except OSError:
         pass
 
@@ -145,25 +153,43 @@ class Call:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._connection = None
-        self.cancelled = False
+        self._socket = None
+        self._cancelled = threading.Event()
 
-    def attach(self, connection) -> None:
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def wait(self, seconds: float = 0) -> None:
+        if self._cancelled.wait(seconds):
+            raise CancelledError()
+
+    def attach(self, sock) -> None:
         with self._lock:
             if self.cancelled:
                 raise CancelledError()
-            self._connection = connection
+            self._socket = sock
 
     def detach(self) -> None:
         with self._lock:
-            self._connection = None
+            self._socket = None
 
     def cancel(self) -> None:
         with self._lock:
-            self.cancelled = True
-            connection = self._connection
-        if connection is not None:
-            _abort(connection.sock)
+            self._cancelled.set()
+            _abort(self._socket)
+            self._socket = None
+
+
+def _retry_delay(header: str | None) -> float | None:
+    if not header:
+        return None
+    if header.isascii() and header.isdigit():
+        return float(header)
+    try:
+        return max(0, parsedate_to_datetime(header).timestamp() - time.time())
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
 
 
 class Gateway:
@@ -172,14 +198,17 @@ class Gateway:
         self.url = (configured or DEFAULT_URL).rstrip("/")
         # Without an explicit URL only the gateway's launcher knows the configured port; another gateway
         # may answer on the default one.
-        self.explicit = self.resolved = bool(configured)
+        self.explicit = bool(configured)
+        self.resolved = False
         self.launcher = Path(launcher or paths.GATEWAY_LAUNCHER)
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def start(self, timeout: float = 90) -> str:
         """Make sure the configured gateway runs and learn its address from its launcher."""
-        if self.explicit and self.status() is not None:
+        if (self.explicit or self.resolved) and self.status() is not None:
+            self.resolved = True
             return self.url
+        self.resolved = False
         if not self.launcher.is_file():
             raise DeskError(f"找不到翻译网关启动器：{self.launcher}", stage="gateway start")
         try:
@@ -197,14 +226,18 @@ class Gateway:
             if not urls:
                 raise DeskError("翻译网关启动器没有给出地址", stage="gateway start")
             self.url = urls[-1].rstrip("/")
+        if self.status() is None:
+            raise DeskError(f"无法在指定地址确认翻译网关：{self.url}", stage="gateway start")
         self.resolved = True
         return self.url
 
     def status(self) -> dict | None:
         try:
             with self._opener.open(self.url + "/status", timeout=2) as response:
+                if urlsplit(response.geturl())[:2] != urlsplit(self.url)[:2]:
+                    return None  # a different HTTP origin cannot vouch for the selected endpoint
                 result = json.load(response)
-        except (OSError, ValueError):
+        except (OSError, ValueError, http.client.HTTPException):
             return None
         return result if isinstance(result, dict) and result.get("service") == SERVICE else None
 
@@ -213,15 +246,33 @@ class Gateway:
         """POST a streaming request and return (text, finish_reason). A stream that ends without its
         end marker or finish reason is an interrupted translation and raises DeskError."""
         call = call or Call()
+        deadline = time.monotonic() + timeout
+        for attempt in range(3):
+            call.wait()
+            try:
+                return self._stream_once(path, body, on_partial, call, max(.01, deadline - time.monotonic()), labels)
+            except DeskError as exc:
+                if (exc.status != 429 or attempt == 2 or exc.retry_after is None
+                        or time.monotonic() + exc.retry_after >= deadline):
+                    raise
+                call.wait(exc.retry_after)
+
+    def _stream_once(self, path, body, on_partial, call, timeout, labels):
         target = urlsplit(self.url)
-        connection = http.client.HTTPConnection(target.hostname, target.port or 80, timeout=timeout)
+        if target.scheme not in ("http", "https") or not target.hostname:
+            raise DeskError("翻译网关地址需要使用 HTTP 或 HTTPS", stage="translate")
+        client = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
+        connection = client(target.hostname, target.port, timeout=timeout)
         raw, shown, finish, done, answering = "", "", None, False, False
+        response = None
         try:
-            call.attach(connection)
+            connection.connect()
+            # getresponse() clears connection.sock on Connection: close. The response's file
+            # still owns this same socket, so retain it until the read finishes.
+            call.attach(connection.sock)
+            payload = {"temperature": DESK_TEMPERATURE, **body, "stream": True}
             connection.request("POST", target.path.rstrip("/") + path,
-                               json.dumps(dict(body, stream=True), ensure_ascii=False).encode("utf-8"), REQUEST_HEADERS)
-            if call.cancelled:
-                raise CancelledError()
+                               json.dumps(payload, ensure_ascii=False).encode("utf-8"), REQUEST_HEADERS)
             response = connection.getresponse()
             if response.status != 200:
                 detail = response.read(4000).decode("utf-8", "replace")
@@ -229,7 +280,9 @@ class Gateway:
                     detail = json.loads(detail)["error"]["message"]
                 except (ValueError, KeyError, TypeError):
                     pass
-                raise DeskError(f"翻译网关 HTTP {response.status}：{detail}", stage="translate", status=response.status)
+                raise DeskError(f"翻译网关 HTTP {response.status}：{detail}", stage="translate", status=response.status,
+                                interrupted=response.status in (400, 413, 422, 429),
+                                retry_after=_retry_delay(response.getheader("Retry-After")) if response.status == 429 else None)
             answering = True
             for line in response:
                 if call.cancelled:
@@ -240,7 +293,10 @@ class Gateway:
                 if data == b"[DONE]":
                     done = True
                     break
-                event = json.loads(data)
+                try:
+                    event = json.loads(data)
+                except ValueError:
+                    raise DeskError("翻译中断：网关返回了不完整的流事件", stage="translate", interrupted=True) from None
                 if event.get("error"):
                     raise DeskError(f"翻译中断：{event['error']}", stage="translate", interrupted=True)
                 for choice in event.get("choices") or []:
@@ -255,7 +311,7 @@ class Gateway:
                     if on_partial and text and text != shown:
                         on_partial(text)
                         shown = text
-        except OSError as exc:
+        except (OSError, http.client.HTTPException) as exc:
             if call.cancelled:
                 raise CancelledError() from None
             reason = getattr(exc, "strerror", None) or exc
@@ -264,7 +320,10 @@ class Gateway:
             raise DeskError(f"无法连接翻译网关：{reason}", stage="translate") from None
         finally:
             call.detach()
+            if response is not None:
+                response.close()
             connection.close()
+        call.wait()
         if not done and finish is None:
             raise DeskError("翻译中断：网关在译文完成前断开了连接", stage="translate", interrupted=True)
         if finish not in (None, "stop", "length"):
@@ -304,12 +363,21 @@ class Audio:
         if not self.python.is_file():
             raise DeskError(f"找不到音频翻译的 Python 环境：{self.python}", stage="audio")
 
-    def open(self) -> None:
+    def open_error(self) -> str:
+        code = self.process.poll() if self.process is not None else None
+        if code == 2:
+            return "现有音频窗口无法切换到指定网关，请先关闭音频翻译再打开。"
+        return f"音频翻译启动失败（exit {code}）" if code else ""
+
+    def open(self, gateway_url: str | None = None) -> None:
         """Start captions: a new app loads Whisper and starts; a running app starts its captions again."""
         with self._lock:
             self._check()
+            env = child_env()
+            if gateway_url:
+                env["TRANSLATION_GATEWAY_URL"] = gateway_url
             self.process = subprocess.Popen([str(self.python), "-m", "audio_caption", "--start"], cwd=self.dir,
-                                            env=child_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                             stderr=subprocess.DEVNULL, creationflags=DETACHED, close_fds=True)
 
     def close(self, timeout: float = 60, retry_after: float = 8) -> None:
