@@ -18,6 +18,7 @@ from collections import deque
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
+from urllib.request import parse_http_list
 
 from filelock import FileLock, Timeout
 
@@ -34,6 +35,7 @@ LOCAL = {"localhost", "127.0.0.1", "::1"}
 EXTENSION_SCHEMES = {"chrome-extension", "moz-extension", "safari-web-extension", "extension"}
 LOCAL_ONLY = {"/v1/captions", "/sessions/open", "/sessions/heartbeat", "/sessions/close", "/admin/stop", "/admin/terms"}
 CACHEABLE = {"/v1/translate", "/v1/chat/completions"}
+CAPTION_STATES = {"loading", "running", "paused", "stopping"}
 BODY_LIMIT = 128 * 1024
 TERMS_BODY_LIMIT = 8 * 1024 * 1024
 HEADER_NAME = re.compile(r"^[A-Za-z0-9-]{1,64}$")
@@ -212,14 +214,17 @@ class Gateway:
 
     def _prune(self):
         now = time.monotonic()
-        expired = [s for s, seen in self.sessions.items() if now - seen > 90]
+        expired = [s for s, entry in self.sessions.items() if now - entry["seen"] > 90]
         for session in expired:
             del self.sessions[session]
         if expired and not self.sessions:
             self.last_used = now
             self._release_gpu()
 
-    def session(self, action, token):
+    def session(self, action, token, caption_state=None):
+        """Caption sessions; open and heartbeat may report what the caption app is doing."""
+        if caption_state is not None and (not isinstance(caption_state, str) or caption_state not in CAPTION_STATES):
+            raise ServiceError(400, "state 应为 " + "、".join(sorted(CAPTION_STATES)))
         revision = self.terms()[1]
         with self.cv:
             self._prune()
@@ -235,9 +240,16 @@ class Gateway:
                 self.last_used = time.monotonic()
                 self._release_gpu()
             else:
-                self.sessions[token] = time.monotonic()
+                previous = self.sessions.get(token, {}).get("state", "loading")
+                self.sessions[token] = {"seen": time.monotonic(), "state": caption_state or previous}
             self.cv.notify_all()
             return {"session": token, "terms_revision": revision}
+
+    def _caption_states(self):
+        counts = {}
+        for entry in self.sessions.values():
+            counts[entry["state"]] = counts.get(entry["state"], 0) + 1
+        return counts
 
     def _active(self):
         if self.unloading:
@@ -262,8 +274,8 @@ class Gateway:
                                 "state": self._model_state(), "parallel": self.parallel,
                                 "idle_unload_s": self.cfg["gateway_idle_seconds"]},
                       "running": dict(self.running), "queued": {"captions": len(self.captions), "text": len(self.bulk)},
-                      "caption_sessions": len(self.sessions), "stopping": self.stopping,
-                      "uptime_s": round(time.monotonic() - self.started)}
+                      "caption_sessions": len(self.sessions), "caption_states": self._caption_states(),
+                      "stopping": self.stopping, "uptime_s": round(time.monotonic() - self.started)}
         report["network"] = {"lan": bool(self.cfg.get("gateway_lan")), "port": int(self.cfg["gateway_port"]),
                              "remote_networks": [str(n) for n in self.networks or LAN_NETWORKS], "devices": self.devices.count()}
         report["cache"] = {"enabled": self.cache is not None, "entries": self.cache.count() if self.cache else 0}
@@ -414,7 +426,9 @@ def _abort(sock):
     except OSError:
         pass
     try:
-        socket.socket(fileno=sock.detach()).close()
+        handle = sock.detach()
+        if handle != -1:
+            socket.close(handle)
     except OSError:
         pass
 
@@ -533,7 +547,10 @@ class Handler(BaseHTTPRequestHandler):
     def _generate(self, state, payload, marks):
         """Always stream from the model, so a client that goes away also stops its generation.
         A watcher notices a departed client even while the model has not answered yet.
-        Returns (text, finish_reason, complete), or None after the client disconnected."""
+
+        Returns (text, finish_reason, complete, reply), or None after the client disconnected. The end
+        of the answer (the JSON body, or a stream's [DONE]) is left to ``reply`` so that the caller
+        can update the cache and statistics before the client sees the answer complete."""
         relay = payload["stream"]
         target = urlsplit(state.runtime.url)
         connection = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
@@ -548,14 +565,17 @@ class Handler(BaseHTTPRequestHandler):
                     left = True
                 if left:
                     gone.set()
-                    _abort(conn.sock)
+                    _abort(upstream_socket)
                     return
 
         parts, finish, done, usage, seen = [], None, False, None, set()
         meta = {"id": "chatcmpl-" + secrets.token_hex(8), "created": int(time.time()), "model": payload["model"]}
+        upstream = None
         try:
             conn.request("POST", target.path.rstrip("/") + "/v1/chat/completions",
                          json.dumps(dict(payload, stream=True), ensure_ascii=False).encode(), {"Content-Type": "application/json"})
+            # getresponse() can transfer a closing connection to the response and clear conn.sock.
+            upstream_socket = conn.sock
             threading.Thread(target=watch, name="client-watch", daemon=True).start()
             upstream = conn.getresponse()
             if upstream.status != 200:
@@ -565,23 +585,20 @@ class Handler(BaseHTTPRequestHandler):
             if relay:
                 self._headers(200, "text/event-stream; charset=utf-8", extra={"X-Gateway-Cache": "miss"})
             for line in upstream:
+                event = _event(line)
+                if event == "done":
+                    done = True
+                    break
                 if relay:
                     self.wfile.write(line)
                     self.wfile.flush()
                 elif self._disconnected():
                     return None
-                event = _event(line)
-                if event == "done":
-                    done = True
-                    if relay:  # SSE dispatches an event on the blank line that ends it
-                        self.wfile.write(b"\n")
-                        self.wfile.flush()
-                    break
                 if event is None:
                     continue
                 if event.get("error"):
                     if relay:
-                        return "".join(parts), "error", False
+                        return "".join(parts), "error", False, lambda: None
                     raise ServiceError(502, f"翻译流中断：{event['error']}")
                 for key in ("id", "created", "model"):
                     if event.get(key) and key not in seen:
@@ -595,34 +612,60 @@ class Handler(BaseHTTPRequestHandler):
                         parts.append(delta)
                     if choice.get("finish_reason"):
                         finish = choice["finish_reason"]
-        except OSError:
+        except (OSError, http.client.HTTPException):
             if gone.is_set():
                 return None
             raise
         finally:
             finished.set()
+            if upstream is not None:
+                upstream.close()
             conn.close()
         if gone.is_set():
             return None
         text = "".join(parts)
         complete = done or finish is not None
-        if not relay:
+        if relay:
+            def reply():
+                if done:  # the end marker, with the blank line on which SSE dispatches it
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+        else:
             if not complete:
                 raise ServiceError(502, "本地翻译服务在译文完成前断开了连接")
-            self._json(200, completion(meta, text, finish or "stop", usage), {"X-Gateway-Cache": "miss"})
-        return text, finish, complete
+
+            def reply():
+                self._json(200, completion(meta, text, finish or "stop", usage), {"X-Gateway-Cache": "miss"})
+        return text, finish, complete, reply
 
     def _translate(self, state, client, path, body):
         caption = path == "/v1/captions"
         kind = "caption" if caption else "text"
-        start, marks, outcome = time.monotonic(), {}, "error"
+        start, marks, outcome, recorded = time.monotonic(), {}, "error", False
+
+        def record():
+            nonlocal recorded
+            if recorded:
+                return
+            recorded = True
+            end = time.monotonic()
+            state.stats.record(client, kind, outcome, total_s=end - start,
+                               first_token_s=marks["first"] - start if "first" in marks else (end - start if outcome == "hit" else None),
+                               queue_s=marks["admitted"] - start if "admitted" in marks else None)
+
         try:
             payload = state.build(path, body)
             key = cache_key(payload) if state.cache and path in CACHEABLE and payload.get("temperature") == 0 else None
-            cached = state.cache.get(key) if key else None
+            cached = None
+            if key:
+                try:
+                    cached = state.cache.get(key)
+                except (sqlite3.Error, OSError) as exc:
+                    log.warning("Cache lookup failed: %s", type(exc).__name__)
             if cached is not None:
-                self._send_cached(payload, cached)
                 outcome = "hit"
+                record()  # bookkeeping first: a client holding the answer also finds it counted
+                self._send_cached(payload, cached)
                 return
             with state.slot(caption, body.get("session"), self._disconnected):
                 marks["admitted"] = time.monotonic()
@@ -634,18 +677,24 @@ class Handler(BaseHTTPRequestHandler):
             if result is None:
                 outcome = "cancelled"
                 return
-            text, finish, complete = result
+            text, finish, complete, reply = result
             outcome = "ok" if complete and finish in (None, "stop") else "error"
-            if key and outcome == "ok" and text.strip():
-                state.cache.put(key, text, payload["model"])
+            # "Cache-Control: no-store" keeps this translation off the disk; cached answers may still serve it.
+            directives = parse_http_list(",".join(self.headers.get_all("Cache-Control", [])))
+            store = all(item.partition("=")[0].strip().lower() != "no-store" for item in directives)
+            if key and store and outcome == "ok" and text.strip():
+                try:
+                    state.cache.put(key, text, payload["model"])
+                except (sqlite3.Error, OSError) as exc:
+                    log.warning("Cache write failed: %s", type(exc).__name__)
+            record()
+            reply()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            outcome = "cancelled"
+            if not recorded:
+                outcome = "cancelled"
             raise
         finally:
-            end = time.monotonic()
-            state.stats.record(client, kind, outcome, total_s=end - start,
-                               first_token_s=marks["first"] - start if "first" in marks else (end - start if outcome == "hit" else None),
-                               queue_s=marks["admitted"] - start if "admitted" in marks else None)
+            record()
 
     def _handle(self):
         state = self.server.state
@@ -678,7 +727,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(body, dict):
                     raise ServiceError(400, "需要 JSON 对象")
                 if path in ("/sessions/open", "/sessions/heartbeat", "/sessions/close"):
-                    self._json(200, state.session(path.rsplit("/", 1)[1], body.get("session")))
+                    self._json(200, state.session(path.rsplit("/", 1)[1], body.get("session"), body.get("state")))
                 elif path == "/admin/stop":
                     state.request_stop()
                     threading.Thread(target=self.server.shutdown, daemon=True).start()

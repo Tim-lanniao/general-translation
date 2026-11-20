@@ -117,6 +117,19 @@ class CaptionClientTests(unittest.TestCase):
         client.stop()
         self.assertEqual(self.state.info()["caption_sessions"], 0)
 
+    def test_explicit_endpoint_owns_the_session_even_with_another_configured_port(self):
+        url = f"http://127.0.0.1:{self.server.server_port}"
+        self.gateway_cfg["gateway_port"] = 9
+        with patch.dict(os.environ, TRANSLATION_GATEWAY_URL=url):
+            captions = GatewayTranslator({"asr_language": "de"})
+            captions.start(lambda _: None)
+            try:
+                self.assertEqual(self.state.info()["caption_sessions"], 1)
+                self.assertEqual(captions.translate("Hallo", "", "")["translation"], "第一句")
+                self.assertIn("revision", translator.read_shared_terms())
+            finally:
+                captions.stop()
+
 
 class BoundaryTests(unittest.TestCase):
     def test_audio_uses_only_the_gateway_client_interface(self):

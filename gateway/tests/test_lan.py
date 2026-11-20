@@ -5,6 +5,7 @@ import io
 import ipaddress
 import json
 import socket
+import sqlite3
 import threading
 import time
 import unittest
@@ -48,10 +49,13 @@ class Model(BaseHTTPRequestHandler):
                 server.unblock.wait(5)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
             self.end_headers()
             for word in ["词"] * 100 if "slow" in text else ["第", "一句"]:
                 self.wfile.write(b"data: " + json.dumps({"id": "up-1", "choices": [{"delta": {"content": word}}]}).encode() + b"\n\n")
                 self.wfile.flush()
+                if "stall" in text:
+                    server.unblock.wait(5)
                 if "slow" in text:
                     time.sleep(.03)
             self.wfile.write(b"data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]}).encode() + b"\n\n")
@@ -229,6 +233,17 @@ class LanGatewayTests(unittest.TestCase):
         status, headers, data = self.call("POST", "/v1/translate", {"source": "Guten Tag"})
         self.assertEqual((headers["x-gateway-cache"], json.loads(data)["usage"]["total_tokens"]), ("hit", 0))
 
+    def test_disconnect_releases_slot_while_the_model_stalls_after_a_token(self):
+        self.start_gateway()
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        conn.request("POST", "/v1/translate", body=json.dumps({"source": "stall", "stream": True}),
+                     headers={"Content-Type": "application/json"})
+        with conn.getresponse() as response:
+            self.assertTrue(response.readline().startswith(b"data:"))
+        conn.close()
+        wait_for(lambda: self.state.info()["active"] is None, seconds=1.5)
+        self.assertEqual(self.post("/v1/translate", {"source": "next"})["choices"][0]["message"]["content"], "第一句")
+
     @unittest.skipUnless(socket.has_ipv6, "no IPv6 on this machine")
     def test_ipv6_listener_also_serves_ipv4_clients(self):
         # LAN mode listens on "::". Tests stay on loopback addresses: listening on all interfaces
@@ -243,6 +258,51 @@ class LanGatewayTests(unittest.TestCase):
             conn.request("GET", "/health")
             self.assertEqual(conn.getresponse().status, 200, listen)
             conn.close()
+
+    def test_no_store_requests_stay_off_the_disk(self):
+        self.start_gateway()
+        quiet = {"Cache-Control": "no-store"}
+        for _ in range(2):
+            status, headers, _ = self.call("POST", "/v1/translate", {"source": "Vertraulich"}, quiet)
+            self.assertEqual((status, headers["x-gateway-cache"]), (200, "miss"))
+        self.assertEqual((self.state.cache.count(), len(self.model.calls)), (0, 2))
+        self.post("/v1/translate", {"source": "Vertraulich"})  # an ordinary client stores it
+        self.assertEqual(self.state.cache.count(), 1)
+        self.assertEqual(self.call("POST", "/v1/translate", {"source": "Vertraulich"}, quiet)[1]["x-gateway-cache"], "hit")
+
+    def test_no_store_matches_complete_directives_across_header_fields(self):
+        self.start_gateway()
+        body = {"source": "Vertraulich"}
+        headers = {"Cache-Control": "no-cache", "cache-control": "max-age=0, No-Store"}
+        self.assertEqual(self.call("POST", "/v1/translate", body, headers)[0], 200)
+        self.assertEqual(self.state.cache.count(), 0)
+        self.call("POST", "/v1/translate", body, {"Cache-Control": 'ext="a,no-store,b", x-no-store'})
+        self.assertEqual(self.state.cache.count(), 1)
+
+    def test_cache_failure_still_delivers_json_and_stream_terminator(self):
+        self.start_gateway()
+        with patch.object(self.state.cache, "put", side_effect=sqlite3.OperationalError("disk full")), \
+                self.assertLogs("translation_gateway.server", level="WARNING"):
+            body = {"source": "Guten Tag"}
+            self.assertEqual(self.post("/v1/translate", body)["choices"][0]["message"]["content"], "第一句")
+            code, _, data = self.call("POST", "/v1/translate", dict(body, stream=True))
+            self.assertEqual(code, 200)
+            self.assertTrue(data.endswith(b"data: [DONE]\n\n"))
+        self.assertEqual(self.state.cache.count(), 0)
+
+    def test_caption_sessions_report_their_state(self):
+        self.start_gateway()
+        session = self.post("/sessions/open", {})["session"]
+        self.assertEqual(self.state.status_report()["caption_states"], {"loading": 1})
+        self.post("/sessions/heartbeat", {"session": session, "state": "running"})
+        self.post("/sessions/heartbeat", {"session": session})  # a plain heartbeat keeps the state
+        self.assertEqual(self.state.status_report()["caption_states"], {"running": 1})
+        for bad in ("dancing", [], {}):
+            with self.subTest(bad=bad), self.assertRaisesRegex(RuntimeError, "400"):
+                self.post("/sessions/heartbeat", {"session": session, "state": bad})
+        self.post("/sessions/close", {"session": session})
+        report = self.state.status_report()
+        self.assertEqual((report["caption_sessions"], report["caption_states"]), (0, {}))
 
     def test_cache_serves_repeats_without_the_model(self):
         self.start_gateway()

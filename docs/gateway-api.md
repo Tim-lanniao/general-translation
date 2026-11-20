@@ -22,15 +22,19 @@
 
 三个翻译接口都接受 `max_tokens` 或 `max_completion_tokens`（最多 512，字幕默认 256），以及 `temperature`、`top_p`、`seed`、`stop`、`stream_options`、`response_format`、`frequency_penalty`、`presence_penalty`。网关总是关闭模型的思考模式，其他字段会被忽略。
 
-响应与 OpenAI 的 `chat.completion` 相同；`stream: true` 时为 SSE，以 `data: [DONE]` 结束。响应头 `X-Gateway-Cache` 为 `hit` 或 `miss`。`finish_reason` 为 `length` 时请缩短原段后重译。
+响应与 OpenAI 的 `chat.completion` 相同；`stream: true` 时为 SSE，以 `data: [DONE]` 结束。没有 `[DONE]` 也没有 `finish_reason` 就断开的流是中断的译文，客户端不应当作完整结果。响应头 `X-Gateway-Cache` 为 `hit` 或 `miss`。`finish_reason` 为 `length` 时请缩短原段后重译。
+
+`/v1/translate` 和 `/v1/chat/completions` 默认缓存 `temperature=0` 的完整译文。任一 `Cache-Control` 请求头含有 `no-store` 指令时，网关跳过写入，已有缓存仍可命中。缓存写入失败时，客户端照常收到完整响应。桌面入口同时使用接近零的正温度，确保升级后仍在运行的旧网关也会跳过磁盘缓存。
 
 ## 实时会话（仅限本机）
 
 | 接口 | 请求 → 响应 |
 |---|---|
-| `POST /sessions/open` | `{}` → `{"session": "…", "terms_revision": "…"}`。打开会话时网关会占用 `gpu_lock` |
-| `POST /sessions/heartbeat` | `{"session": "…"}` → 同上。90 秒内没有心跳的会话会过期，音频翻译每 10 秒发一次 |
+| `POST /sessions/open` | `{}`，可带 `state` → `{"session": "…", "terms_revision": "…"}`。打开会话时网关会占用 `gpu_lock` |
+| `POST /sessions/heartbeat` | `{"session": "…"}`，可带 `state` → 同上。90 秒内没有心跳的会话会过期；音频翻译每 10 秒发一次，状态变化时立即再发一次 |
 | `POST /sessions/close` | `{"session": "…"}` → 同上 |
+
+`state` 是字幕程序当前的状态：`loading`（会话已建立，Whisper 还在加载）、`running`（正在出字幕）、`paused`、`stopping`。不带时沿用上一次的值，新会话默认为 `loading`。
 
 `terms_revision` 是共享术语内容的哈希。它变化时，客户端缓存的同一原文译文应作废。
 
@@ -47,4 +51,4 @@
 | 接口 | 内容 |
 |---|---|
 | `GET /health` | `service`（固定为 `translation-gateway`）、`model`、`loaded`、`active`、`caption_sessions`、`queued_captions`、`queued_text`、`stopping` |
-| `GET /status` | 模型状态（`unloaded`、`loading`、`ready`、`unloading`）、并行数、各队列、术语条数与版本、缓存条数、网络设置，以及每台设备的请求数、缓存命中率、首字与总耗时（P50/P95）。不含任何原文或译文 |
+| `GET /status` | 模型状态（`unloaded`、`loading`、`ready`、`unloading`）、并行数、各队列、字幕会话数 `caption_sessions` 及按状态的计数 `caption_states`（如 `{"running": 1}`）、术语条数与版本、缓存条数、网络设置，以及每台设备的请求数、缓存命中率、首字与总耗时（P50/P95）。不含任何原文或译文 |

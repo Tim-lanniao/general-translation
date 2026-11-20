@@ -15,7 +15,7 @@ from . import config
 CFG = config.load()
 config.prepare_environment(CFG)
 
-from PySide6.QtCore import QObject, QRect, QRectF, Qt, QTimer, Signal  # noqa: E402
+from PySide6.QtCore import QDir, QLockFile, QObject, QRect, QRectF, Qt, QTimer, Signal  # noqa: E402
 from PySide6.QtGui import QColor, QFont, QIcon, QImage, QLinearGradient, QPainter, QPainterPath, QTextCursor  # noqa: E402
 from PySide6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,  # noqa: E402
@@ -546,6 +546,23 @@ class ControlWindow(QWidget):
         self.engine.start_async()
         self.set_state("loading", "正在准备…")
 
+    def start_captions(self, gateway_url=""):
+        if self.closing or self.engine.state == "stopping":
+            return False
+        if gateway_url:
+            if self.engine.state in ("idle", "error"):
+                os.environ["TRANSLATION_GATEWAY_URL"] = gateway_url
+            else:
+                session = self.engine.translator
+                cfg = session.gateway_cfg if session is not None else translator.gateway_settings()
+                if gateway_url != translator.client.gateway_url(cfg):
+                    return False  # keep an existing live session on its own gateway
+        if self.engine.state in ("idle", "error"):
+            self.start_engine()
+        elif self.engine.state == "running" and self.engine.paused:
+            self.toggle_pause()
+        return True
+
     def toggle_pause(self):
         if self.engine.state != "running":
             return
@@ -746,6 +763,28 @@ def setup_logging():
     root.addHandler(h)
 
 
+def forward_to_audio(command):
+    """None if there is no listener, otherwise the exit status for the forwarding process."""
+    sock = QLocalSocket()
+    sock.connectToServer(APP_KEY)
+    if not sock.waitForConnected(300):
+        return None
+    sock.write(command)
+    sock.flush()
+    if sock.bytesToWrite() and not sock.waitForBytesWritten(1000):
+        return 1
+    if command == b"quit":
+        # The resident holds this socket until its engine has stopped and its listener is closed.
+        disconnected = QLocalSocket.LocalSocketState.UnconnectedState
+        if sock.state() != disconnected and not sock.waitForDisconnected(55000) and sock.state() != disconnected:
+            return 1
+    if command.startswith(b"start "):
+        if not sock.bytesAvailable() and not sock.waitForReadyRead(3000):
+            return 2  # an older resident cannot confirm the selected gateway
+        return 0 if bytes(sock.readAll()) == b"ok" else 2
+    return 0
+
+
 def main():
     setup_logging()
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
@@ -753,35 +792,60 @@ def main():
     app.setApplicationName("通用音频翻译")
     app.setFont(QFont("Microsoft YaHei UI", 10))
 
-    # single instance: a second launch just brings the running window forward
-    sock = QLocalSocket()
-    sock.connectToServer(APP_KEY)
-    if sock.waitForConnected(300):
-        sock.write(b"quit" if "--quit" in sys.argv else b"show")
-        sock.flush()
-        sock.waitForBytesWritten(300)
-        return 0
-    if "--quit" in sys.argv:
-        return 0
+    # single instance: a second launch passes its command (show, start captions, quit) to the running one
+    command = b"quit" if "--quit" in sys.argv else b"start" if "--start" in sys.argv else b"show"
+    requested_url = os.environ.get("TRANSLATION_GATEWAY_URL", "").rstrip("/")
+    message = b"start " + requested_url.encode("utf-8") if command == b"start" and requested_url else command
+    lock = QLockFile(os.path.join(QDir.tempPath(), APP_KEY + ".lock"))
+    lock.setStaleLockTime(0)
+    deadline = time.monotonic() + 10
+    while True:
+        owned = lock.tryLock(0)
+        # An older resident has a listener but no lock. A new one holds its lock from
+        # before listen() until after shutdown and closing the command server.
+        forwarded = forward_to_audio(message)
+        if forwarded is not None:
+            return forwarded
+        if owned:
+            if command == b"quit":
+                return 0
+            break
+        if time.monotonic() >= deadline:
+            return 1
+        time.sleep(.15)
     QLocalServer.removeServer(APP_KEY)
     server = QLocalServer()
-    server.listen(APP_KEY)
+    if not server.listen(APP_KEY):
+        raise RuntimeError(f"无法建立字幕命令通道：{server.errorString()}")
 
     cfg = CFG
     win = ControlWindow(cfg)
+    quit_waiters = []
+
     def on_connection():
         conn = server.nextPendingConnection()
-        msg = bytes(conn.readAll()) if conn.waitForReadyRead(500) else b""
+        msg = bytes(conn.readAll()) if conn.bytesAvailable() or conn.waitForReadyRead(500) else b""
         if msg == b"quit":
-            win.quit_now()
-        else:
+            quit_waiters.append(conn)
+            if not win.closing:  # a repeated quit must not cut the shutdown short (the session would linger)
+                win.quit_now()
+            return
+        if not win.closing:
             win.bring_to_front()
             win.overlay.show()
+        action, _, address = msg.partition(b" ")
+        if action == b"start":
+            started = win.start_captions(address.decode("utf-8"))
+            if address:
+                conn.write(b"ok" if started else b"unavailable")
+                conn.flush()
+        conn.disconnectFromServer()
+        conn.deleteLater()
 
     server.newConnection.connect(on_connection)
     win.show()
     win.overlay.show()
-    if cfg.get("auto_start", True) and "--no-auto-start" not in sys.argv:
+    if command == b"start" or (cfg.get("auto_start", True) and "--no-auto-start" not in sys.argv):
         QTimer.singleShot(400, win.start_engine)
     snap = os.environ.get("TEAMS_CAPTION_SNAPSHOT")
     if snap:  # debugging aid: periodic screenshots of both windows
@@ -796,7 +860,12 @@ def main():
         t = QTimer(win, interval=2500, timeout=grab)
         t.start()
     log.info("UI started")
-    return app.exec()
+    code = app.exec()
+    server.close()
+    lock.unlock()
+    for conn in quit_waiters:
+        conn.disconnectFromServer()
+    return code
 
 
 def run():
