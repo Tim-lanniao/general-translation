@@ -24,6 +24,7 @@ class TranslationCache:
         self.db.execute("CREATE TABLE IF NOT EXISTS entries (key TEXT PRIMARY KEY, content TEXT NOT NULL, model TEXT,"
                         " created REAL NOT NULL, used REAL NOT NULL, hits INTEGER NOT NULL DEFAULT 0)")
         self.db.execute("CREATE INDEX IF NOT EXISTS entries_used ON entries (used)")
+        self._prune()  # a lower limit, or runs with fewer than 200 writes each, still converge on max_entries
 
     def get(self, key: str) -> str | None:
         with self.lock:

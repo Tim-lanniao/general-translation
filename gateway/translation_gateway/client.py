@@ -21,7 +21,6 @@ from filelock import FileLock
 from . import config
 
 SERVICE = "translation-gateway"
-LEGACY_SERVICES = {"audio-translation"}  # a gateway started by the single-package version
 _LABELS = ("当前语句", "译文", "翻译", "中文")
 _LEAK = re.compile(r"^(?:当前语句|译文|翻译|中文)\s*[:：]\s*")
 _DETACHED = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -49,7 +48,7 @@ def status(cfg):
         result = request_json(cfg, "/health", timeout=1)
     except (OSError, ValueError):
         return None
-    if result.get("service") != SERVICE and result.get("service") not in LEGACY_SERVICES:
+    if result.get("service") != SERVICE:
         raise RuntimeError("翻译网关端口已被其他服务占用")
     return result
 
@@ -57,7 +56,7 @@ def status(cfg):
 def _python():
     """The gateway needs only the standard library and filelock, so any of the project's
     interpreters can run it; TRANSLATION_GATEWAY_PYTHON selects a dedicated one."""
-    chosen = os.environ.get("TRANSLATION_GATEWAY_PYTHON") or os.environ.get("TEAMS_GATEWAY_PYTHON")
+    chosen = os.environ.get("TRANSLATION_GATEWAY_PYTHON")
     return chosen if chosen and Path(chosen).is_file() else sys.executable
 
 

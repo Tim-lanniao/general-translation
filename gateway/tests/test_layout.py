@@ -1,9 +1,12 @@
-"""Data directory split, the shared-glossary endpoint and the gateway's independence from other components."""
+"""Data root, the shared-glossary endpoint and the gateway's independence from other components."""
 import ast
 import http.client
 import ipaddress
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -11,57 +14,20 @@ from unittest.mock import Mock, patch
 
 from support import isolated_data
 from translation_gateway import access, client, config
+from translation_gateway.cache import TranslationCache
 from translation_gateway.server import Gateway, Handler, Server
 
 PACKAGE = Path(config.__file__).resolve().parent
 
 
-class LegacyLayoutTests(unittest.TestCase):
-    def setUp(self):
-        self.root = isolated_data(self).parent
-
-    def test_single_package_data_root_is_split_once(self):
-        legacy = {"source": "device:custom", "terms": "Messe", "topic": "周会", "font_px": 30, "cache_dir": "C:/cache",
-                  "gpu_lock": "C:/gpu.lock", "llm_controller": "C:/strata.ps1", "llm_model": "qwen", "gateway_lan": True}
-        (self.root / "config.json").write_text(json.dumps(legacy), encoding="utf-8")
-        (self.root / "gateway-terms.txt").write_text("Messe=展会", encoding="utf-8")
-        (self.root / "gateway-devices.json").write_text('{"devices": []}', encoding="utf-8")
-        (self.root / "model-test.active").touch()
-        (self.root / "会议记录" / "2026-11-19_100000").mkdir(parents=True)
-        (self.root / "会议记录" / "2026-11-19_100000" / "captions.md").write_text("记录", encoding="utf-8")
-        (self.root / "logs").mkdir()
-        for name in ("teams-caption.log", "translation-gateway.log"):
-            (self.root / "logs" / name).write_text(name, encoding="utf-8")
-
-        self.assertTrue(config.migrate_legacy())
-        gateway = json.loads((self.root / "gateway" / "config.json").read_text(encoding="utf-8"))
-        audio = json.loads((self.root / "audio" / "config.json").read_text(encoding="utf-8"))
-        self.assertEqual(gateway, {"cache_dir": "C:/cache", "gpu_lock": "C:/gpu.lock", "llm_controller": "C:/strata.ps1",
-                                   "llm_model": "qwen", "gateway_lan": True})
-        self.assertEqual(audio, {"source": "device:custom", "terms": "Messe", "topic": "周会", "font_px": 30, "cache_dir": "C:/cache"})
-        self.assertEqual(config.read_terms(), "Messe=展会")
-        self.assertTrue((self.root / "gateway" / "devices.json").exists())
-        self.assertTrue((self.root / "gateway" / "model-test.active").exists())
-        self.assertEqual((self.root / "audio" / "会议记录" / "2026-11-19_100000" / "captions.md").read_text(encoding="utf-8"), "记录")
-        self.assertTrue((self.root / "audio" / "logs" / "teams-caption.log").exists())
-        self.assertTrue((self.root / "gateway" / "logs" / "translation-gateway.log").exists())
-        self.assertEqual(json.loads((self.root / "config.legacy.json").read_text(encoding="utf-8")), legacy)
-        for gone in ("config.json", "gateway-terms.txt", "会议记录", "logs"):
-            self.assertFalse((self.root / gone).exists(), gone)
-
-        self.assertFalse(config.migrate_legacy())  # nothing left to move
-        self.assertEqual(config.load()["llm_controller"], "C:/strata.ps1")
-
-    def test_terms_from_before_the_shared_glossary_become_the_gateway_glossary(self):
-        (self.root / "config.json").write_text(json.dumps({"terms": "Presse=压力机"}), encoding="utf-8")
-        config.load()
-        self.assertEqual(config.read_terms(), "Presse=压力机")
-
-    def test_new_installations_need_no_migration(self):
-        self.assertFalse(config.migrate_legacy())
-        self.assertEqual(config.load()["gateway_port"], 18083)
-        self.assertEqual(config.read_terms(), "")
-
+class DataRootTests(unittest.TestCase):
+    def test_a_relative_data_root_becomes_absolute(self):
+        """A gateway started by a client runs in gateway/ and must still find the client's data root."""
+        with tempfile.TemporaryDirectory() as folder:
+            code = "from translation_gateway import config; print(config.ROOT)"
+            env = dict(os.environ, TRANSLATION_DATA="relative-data", PYTHONPATH=str(PACKAGE.parent))
+            out = subprocess.run([sys.executable, "-c", code], cwd=folder, env=env, capture_output=True, text=True, check=True)
+            self.assertEqual(Path(out.stdout.strip()), Path(folder).resolve() / "relative-data")
 
 class TermsEndpointTests(unittest.TestCase):
     def setUp(self):
@@ -94,6 +60,24 @@ class TermsEndpointTests(unittest.TestCase):
             client.request_json(self.cfg, "/admin/terms", {"terms": 3})
         client.request_json(self.cfg, "/sessions/close", {"session": session["session"]})
 
+    def test_a_large_glossary_can_be_saved_back(self):
+        raw = "\n".join(f"Bauteil{i:05d}=零件{i:05d}" for i in range(12000))  # about 300 KB, above a request's limit
+        self.assertGreater(len(raw.encode("utf-8")), 128 * 1024)
+        self.assertEqual(client.request_json(self.cfg, "/admin/terms", {"terms": raw})["entries"], 12000)
+        self.assertEqual(client.request_json(self.cfg, "/admin/terms")["terms"], raw)
+
+    def test_cache_keeps_its_limit_across_restarts(self):
+        path = config.DATA_DIR / "cache" / "limit.sqlite3"
+        cache = TranslationCache(path, 100)
+        for i in range(150):  # fewer than the 200 writes that trigger pruning during a run
+            cache.put(f"key{i}", "译文", "model")
+        self.assertEqual(cache.count(), 150)
+        cache.close()
+        cache = TranslationCache(path, 100)
+        self.addCleanup(cache.close)
+        self.assertEqual(cache.count(), 100)
+        self.assertEqual(cache.get("key149"), "译文")
+
     def test_other_devices_cannot_read_or_change_the_glossary(self):
         self.cfg["gateway_lan"] = True
         token = access.add_device("mac")
@@ -108,12 +92,13 @@ class TermsEndpointTests(unittest.TestCase):
 
 
 class IndependenceTests(unittest.TestCase):
-    def test_health_names_the_service_and_older_gateways_are_recognised(self):
-        with patch.object(client, "request_json", return_value={"service": "audio-translation", "stopping": False}):
+    def test_clients_only_accept_this_gateway_on_the_port(self):
+        with patch.object(client, "request_json", return_value={"service": "translation-gateway", "stopping": False}):
             self.assertTrue(client.status({}))
-        with patch.object(client, "request_json", return_value={"service": "something-else"}):
-            with self.assertRaises(RuntimeError):
-                client.status({})
+        for other in ("audio-translation", "something-else"):
+            with patch.object(client, "request_json", return_value={"service": other}):
+                with self.assertRaises(RuntimeError):
+                    client.status({})
 
     def test_gateway_imports_only_the_standard_library_and_filelock(self):
         allowed = set(sys.stdlib_module_names) | {"filelock", "translation_gateway"}

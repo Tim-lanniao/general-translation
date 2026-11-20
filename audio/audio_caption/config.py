@@ -6,7 +6,7 @@ Everything machine-specific (model paths, CUDA DLLs, a shared GPU lock) lives in
 (``<data root>/gateway/config.json``).
 
 Data directory: ``<data root>/audio``, with the data root shared with the gateway
-(``%TRANSLATION_DATA%``, else ``%TEAMS_CAPTION_DATA%``, else ``<repo>/data``).
+(``%TRANSLATION_DATA%``, else ``<repo>/data``).
 """
 from __future__ import annotations
 
@@ -64,16 +64,12 @@ DEFAULTS = {
     "cache_dir": "",             # empty = <data root>/audio/cache
     "sample_wav": "",           # optional 16 kHz mono German WAV offered as a test source
 }
-# Written by the single-package version; the gateway keeps its own copy now.
-RETIRED = ("llama_server", "hymt_model", "hymt_port", "stop_owned_server_on_exit", "gateway_port", "gateway_idle_seconds",
-           "gateway_lan", "gateway_networks", "gateway_cache", "gateway_cache_entries", "llm_parallel", "llm_url",
-           "llm_model", "llm_label", "llm_controller", "gpu_lock")  # caption sessions hold gpu_lock in the gateway
+RETIRED = ("llama_server", "hymt_model", "hymt_port", "stop_owned_server_on_exit")
 
 LANGUAGES = gateway_config.LANGUAGES
 
 
 def load() -> dict:
-    gateway_config.migrate_legacy()
     cfg = dict(DEFAULTS)
     try:
         saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))

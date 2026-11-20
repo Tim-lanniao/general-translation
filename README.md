@@ -25,15 +25,13 @@ gateway/  翻译网关：调度、术语、缓存、设备 token ──▶ Strat
 
 ## 数据目录
 
-数据根目录依次取 `TRANSLATION_DATA`、旧名 `TEAMS_CAPTION_DATA`，都没有时为仓库下的 `data\`。两个组件各用一个子目录：
+数据根目录取 `TRANSLATION_DATA`（相对路径按启动时的工作目录换算成绝对路径），没有设置时为仓库下的 `data\`。两个组件各用一个子目录：
 
 ```text
 <数据根目录>\
   gateway\  config.json  terms.txt  devices.json  cache\  logs\
   audio\    config.json  会议记录\  logs\
 ```
-
-旧版把所有内容放在根目录的一个 `config.json` 里。新版首次启动时会把它拆成两份，把术语、设备、会议记录和日志移到对应的子目录，原文件改名为 `config.legacy.json` 留作备份。
 
 ## 测试
 

@@ -56,18 +56,13 @@ class AudioSettingsTests(unittest.TestCase):
         self.root = isolated_data(self)
         (self.root / "audio").mkdir()
 
-    def test_audio_default_migration_and_retired_gateway_keys(self):
-        config.CONFIG_PATH.write_text(json.dumps({"source": "device:default", "translator": "hymt7b", "llm_url": "x"}))
+    def test_audio_default_source_and_translator(self):
+        config.CONFIG_PATH.write_text(json.dumps({"source": "device:default", "translator": "hymt7b"}))
         cfg = config.load()
         self.assertEqual((cfg["source"], cfg["translator"]), ("system", "qwen"))
-        self.assertNotIn("llm_url", cfg)
         config.CONFIG_PATH.write_text(json.dumps({"source": "device:custom", "terms": "Messe"}))
         self.assertEqual(config.load()["source"], "device:custom")
-
-    def test_legacy_root_is_split_before_the_audio_settings_load(self):
-        (self.root / "config.json").write_text(json.dumps({"font_px": 30, "llm_controller": "C:/strata.ps1"}), encoding="utf-8")
-        self.assertEqual(config.load()["font_px"], 30)
-        self.assertEqual(gateway_config.load()["llm_controller"], "C:/strata.ps1")
+        self.assertNotIn("llm_url", config.load())  # model settings belong to the gateway
 
     def test_system_capture_excludes_this_process_and_falls_back_to_a_device(self):
         capture = LoopbackCapture(source_spec("system"), Mock(), Mock())
