@@ -10,6 +10,8 @@ if not exist "%TC_PY%" (
   pause
   exit /b 1
 )
+rem A relative data root means the folder it was started from, for every component started from here.
+if defined TRANSLATION_DATA for %%I in ("%TRANSLATION_DATA%") do set "TRANSLATION_DATA=%%~fI"
 cd /d "%~dp0"
 start "" "%TC_PY%" -m audio_caption %*
 exit /b 0

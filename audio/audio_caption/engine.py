@@ -342,6 +342,9 @@ class CaptionEngine:
         self.state = state
         log.info("[%s] %s", state, text)
         self.emit({"type": "status", "state": state, "text": text})
+        if self.translator and state in ("loading", "running", "stopping"):
+            # Lets other programs tell a loading session from running captions (GET /status on the gateway).
+            self.translator.report("paused" if state == "running" and self.paused else state)
 
     def start_async(self):
         if self.state not in ("idle", "error"):

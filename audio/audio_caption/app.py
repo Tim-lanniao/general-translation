@@ -753,15 +753,16 @@ def main():
     app.setApplicationName("通用音频翻译")
     app.setFont(QFont("Microsoft YaHei UI", 10))
 
-    # single instance: a second launch just brings the running window forward
+    # single instance: a second launch passes its command (show, start captions, quit) to the running one
+    command = b"quit" if "--quit" in sys.argv else b"start" if "--start" in sys.argv else b"show"
     sock = QLocalSocket()
     sock.connectToServer(APP_KEY)
     if sock.waitForConnected(300):
-        sock.write(b"quit" if "--quit" in sys.argv else b"show")
+        sock.write(command)
         sock.flush()
         sock.waitForBytesWritten(300)
         return 0
-    if "--quit" in sys.argv:
+    if command == b"quit":
         return 0
     QLocalServer.removeServer(APP_KEY)
     server = QLocalServer()
@@ -773,15 +774,18 @@ def main():
         conn = server.nextPendingConnection()
         msg = bytes(conn.readAll()) if conn.waitForReadyRead(500) else b""
         if msg == b"quit":
-            win.quit_now()
+            if not win.closing:  # a repeated quit must not cut the shutdown short (the session would linger)
+                win.quit_now()
         else:
             win.bring_to_front()
             win.overlay.show()
+            if msg == b"start" and win.engine.state in ("idle", "error"):
+                win.start_engine()
 
     server.newConnection.connect(on_connection)
     win.show()
     win.overlay.show()
-    if cfg.get("auto_start", True) and "--no-auto-start" not in sys.argv:
+    if command == b"start" or (cfg.get("auto_start", True) and "--no-auto-start" not in sys.argv):
         QTimer.singleShot(400, win.start_engine)
     snap = os.environ.get("TEAMS_CAPTION_SNAPSHOT")
     if snap:  # debugging aid: periodic screenshots of both windows

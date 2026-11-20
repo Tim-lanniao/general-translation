@@ -14,26 +14,36 @@ class GatewayTranslator:
         self.gateway_cfg = gateway_cfg if gateway_cfg is not None else gateway_config.load()
         self.label = self.gateway_cfg.get("llm_label") or self.gateway_cfg["llm_model"]
         self.session = None
+        self.state = "loading"      # what this session tells the gateway the caption app is doing
         self.terms_revision = None  # the gateway's glossary version, part of the caption cache key
         self.closed = threading.Event()
         self.thread = None
 
-    def _call(self, path, body):
-        result = client.request_json(self.gateway_cfg, path, body)
+    def _call(self, path, body, timeout=5):
+        result = client.request_json(self.gateway_cfg, path, body, timeout=timeout)
         self.terms_revision = result.get("terms_revision", self.terms_revision)
         return result
 
     def start(self, progress):
         progress("连接本地翻译网关…")
         client.ensure_gateway(self.gateway_cfg)
-        self.session = self._call("/sessions/open", {})["session"]
+        self.session = self._call("/sessions/open", {"state": self.state})["session"]
         self.thread = threading.Thread(target=self._heartbeat, name="caption-session", daemon=True)
         self.thread.start()
+
+    def report(self, state):
+        """Tell the gateway at once that the caption app is loading, running, paused or stopping."""
+        self.state = state
+        if self.session and not self.closed.is_set():
+            try:
+                self._call("/sessions/heartbeat", {"session": self.session, "state": state}, timeout=2)
+            except (OSError, RuntimeError):
+                pass  # the next heartbeat carries it
 
     def _heartbeat(self):
         while not self.closed.wait(10):
             try:
-                self._call("/sessions/heartbeat", {"session": self.session})
+                self._call("/sessions/heartbeat", {"session": self.session, "state": self.state})
             except (OSError, RuntimeError):
                 if self.closed.wait(1):
                     return

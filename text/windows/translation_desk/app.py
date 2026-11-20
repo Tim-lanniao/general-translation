@@ -13,7 +13,7 @@ import threading
 import time
 from concurrent.futures import CancelledError
 
-from PySide6.QtCore import QEvent, QObject, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QDir, QEvent, QLockFile, QObject, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPainterPath, QPixmap, QTextCursor
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QMenu, QMessageBox, QPlainTextEdit,
@@ -25,13 +25,16 @@ log = logging.getLogger("translation_desk")
 APP_KEY = "TranslationDesk-" + os.environ.get("USERNAME", "user")
 COMMANDS = {"--open-audio": b"open-audio", "--close-audio": b"close-audio", "--quit": b"quit"}
 AUDIO_OPEN_SECONDS = 120   # Whisper alone takes a few seconds; a cold Qwen adds about 25
-AUDIO_CLOSE_SECONDS = 60
+AUDIO_CLOSE_SECONDS = 90
+STATUS_MISSES = 3          # unanswered status requests before the gateway counts as gone
+ACTIVE = ("loading", "running", "paused")
 
 STYLE = """
 QWidget#root { background: #F3F6F4; }
 QLabel { color: #23332C; }
 QLabel#title { font: 700 20px 'Microsoft YaHei UI'; color: #1D4034; }
 QLabel#muted { color: #6A7D73; font-size: 12px; }
+QLabel#warning { color: #B3402F; font-size: 12px; }
 QLabel#section { font-weight: 600; color: #1D4034; }
 QFrame#card { background: #FFFFFF; border: 1px solid #DCE5DF; border-radius: 12px; }
 QPlainTextEdit { border: 1px solid #DCE5DF; border-radius: 8px; padding: 6px; background: #FFFFFF;
@@ -68,13 +71,18 @@ def make_icon() -> QIcon:
     return icon
 
 
+def _log_reason(exc: Exception) -> str:
+    """What may go to the log file: never the message, which can quote the text being translated."""
+    return exc.log_line() if isinstance(exc, backend.DeskError) else type(exc).__name__
+
+
 class Bridge(QObject):
     """Worker threads talk to the window through these signals."""
-    status = Signal(object)        # GET /status, or None
-    startup = Signal(str, bool)    # message ("" when done), is_error
-    partial = Signal(int, str)     # job, translation so far
-    done = Signal(int, str, str)   # job, translation, note
-    audio_error = Signal(str)
+    status = Signal(object)            # GET /status, or None
+    startup = Signal(str, bool)        # message ("" when done), is_error
+    partial = Signal(int, str)         # job, translation so far
+    done = Signal(int, str, str, bool)  # job, translation, note, whether something is missing
+    audio_done = Signal(str)           # "" or what went wrong
 
 
 class DeskWindow(QWidget):
@@ -83,9 +91,12 @@ class DeskWindow(QWidget):
         self.gateway, self.audio, self.settings = gateway, audio, settings
         self.bridge = Bridge()
         self.status = None
-        self.job = 0
+        self.misses = 0
+        self.job, self.call = 0, None
         self.startup_note, self.startup_error = "", False
-        self.audio_pending = None   # ("opening" | "closing", deadline)
+        self.audio_state = "stopped"  # last caption state the gateway reported
+        self.audio_pending = None     # ("opening" | "closing", deadline): the last request, until the state matches
+        self.audio_busy = 0           # audio commands still running
         self.audio_note = ""
         self.polling = False
         self.quitting = False
@@ -100,9 +111,9 @@ class DeskWindow(QWidget):
         self.bridge.startup.connect(self.on_startup)
         self.bridge.partial.connect(self.on_partial)
         self.bridge.done.connect(self.on_done)
-        self.bridge.audio_error.connect(self.on_audio_error)
+        self.bridge.audio_done.connect(self.on_audio_done)
         self._build_tray()
-        self._show_audio(False)
+        self._show_audio()
         self.poll_timer = QTimer(self, interval=2000, timeout=self.poll)
         if start:
             self.poll_timer.start()
@@ -159,6 +170,7 @@ class DeskWindow(QWidget):
         row = QHBoxLayout()
         self.note_label = QLabel("")
         self.note_label.setObjectName("muted")
+        self.note_label.setWordWrap(True)
         row.addWidget(self.note_label, 1)
         self.copy_button = QPushButton("复制译文")
         self.copy_button.setEnabled(False)
@@ -204,7 +216,8 @@ class DeskWindow(QWidget):
         return super().eventFilter(watched, event)
 
     def _show_footer(self):
-        self.footer.setText(f"关闭窗口后在托盘继续运行。浏览器扩展、Pot 等工具可直接使用 {self.gateway.url}/v1，API key 填 local。")
+        address = f"{self.gateway.url}/v1" if self.gateway.resolved else "网关的地址"
+        self.footer.setText(f"关闭窗口后在托盘继续运行。浏览器扩展、Pot 等工具可直接使用 {address}，API key 填 local。")
 
     def _build_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -246,12 +259,12 @@ class DeskWindow(QWidget):
             self.bridge.startup.emit("", False)
             log.info("text mode ready after %.1f s", time.perf_counter() - started)
         except Exception as exc:  # noqa: BLE001
-            log.warning("start-up failed: %s", exc)
+            log.warning("start-up: %s", _log_reason(exc))
             self.bridge.startup.emit(str(exc), True)
         self.poll()
 
     def poll(self):
-        if self.polling:
+        if self.polling or not self.gateway.resolved:  # before start-up only the launcher knows the address
             return
         self.polling = True
 
@@ -269,20 +282,21 @@ class DeskWindow(QWidget):
         self._show_model()
 
     def on_status(self, status):
+        if status is None:
+            self.misses += 1
+            if self.status is not None and self.misses < STATUS_MISSES:
+                return  # one slow answer is no reason to show the gateway or the captions as gone
+        else:
+            self.misses = 0
         self.status = status
         if self.startup_error and backend.describe(status)[0] == "ready":
             self.startup_note, self.startup_error = "", False
         self._show_model()
-        running = backend.Audio.running(status)
-        if self.audio_pending:
-            kind, deadline = self.audio_pending
-            if running == (kind == "opening"):
-                self.audio_pending = None
-            elif time.monotonic() > deadline:
-                self.audio_pending = None
-                self.audio_note = ("音频翻译没有开始字幕。若它的窗口已经打开，请在窗口里点「开始字幕」。" if kind == "opening"
-                                   else "音频翻译还没有退出，请在它的窗口里关闭。")
-        self._show_audio(running)
+        state = backend.caption_state(status)
+        if state != "unknown":
+            self.audio_state = state
+        self._settle_audio(state)
+        self._show_audio()
 
     def _show_model(self):
         state, line = backend.describe(self.status)
@@ -297,39 +311,66 @@ class DeskWindow(QWidget):
         if not text:
             self.source_edit.setFocus()
             return
+        if self.call:  # the previous request leaves the queue or the model at once
+            self.call.cancel()
         self.job += 1
-        job = self.job
+        job, call = self.job, backend.Call()
+        self.call = call
         source, target = self.source_box.currentData(), self.target_box.currentData()
         pieces = backend.split_paragraphs(text)
+        paragraphs = [sum(p.new_paragraph for p in pieces[:i + 1]) for i in range(len(pieces))]
         self.output.clear()
         self.copy_button.setEnabled(False)
-        self.note_label.setText("翻译中…" if len(pieces) == 1 else f"翻译中 · 共 {len(pieces)} 段")
+        self._note("翻译中…" if paragraphs[-1] == 1 else f"翻译中 · 共 {paragraphs[-1]} 段")
 
         def work():
-            done, notes, started = [], [], time.perf_counter()
+            results, broken, started = [], [], time.perf_counter()
             try:
-                if self.gateway.status() is None:
+                if not self.gateway.resolved or self.gateway.status() is None:
                     self.gateway.start()
                 for i, piece in enumerate(pieces):
-                    def partial(text_so_far, done=done):
-                        self.bridge.partial.emit(job, "\n\n".join([*done, text_so_far]))
+                    def partial(text_so_far, done=list(results)):
+                        self.bridge.partial.emit(job, backend.join_pieces(pieces, [*done, text_so_far], target))
 
-                    result, finish = self.gateway.translate(piece, source, target, context=pieces[i - 1] if i else "",
-                                                            on_partial=partial, cancelled=lambda: job != self.job)
-                    if finish == "length":
-                        notes.append(f"第 {i + 1} 段过长，译文可能不完整")
-                    done.append(result)
-                    self.bridge.partial.emit(job, "\n\n".join(done))
-                seconds = time.perf_counter() - started
-                log.info("translated %d characters in %d piece(s), %.2f s", len(text), len(pieces), seconds)
-                self.bridge.done.emit(job, "\n\n".join(done), " · ".join([f"用时 {seconds:.1f} 秒", *notes]))
+                    try:
+                        result, finish = self.gateway.translate(piece.text, source, target, on_partial=partial, call=call,
+                                                                context=pieces[i - 1].text if i else "")
+                        if finish == "length":
+                            result += f"〔第 {paragraphs[i]} 段过长，译文在这里被截断〕"
+                            broken.append(paragraphs[i])
+                    except backend.DeskError as exc:
+                        log.warning("piece %d of %d: %s", i + 1, len(pieces), _log_reason(exc))
+                        broken.append(paragraphs[i])
+                        if not exc.interrupted:  # the gateway cannot be reached: the remaining text stays untranslated
+                            results.append(f"〔第 {paragraphs[i]} 段起没有翻译：{exc}〕")
+                            pieces[:] = pieces[:len(results)]
+                            break
+                        result = f"〔第 {paragraphs[i]} 段翻译中断，没有译文：{exc}〕"
+                    results.append(result)
+                    self.bridge.partial.emit(job, backend.join_pieces(pieces, results, target))
             except CancelledError:
-                pass
+                return
             except Exception as exc:  # noqa: BLE001
-                log.warning("translation failed: %s", exc)
-                self.bridge.done.emit(job, "\n\n".join(done), f"翻译出错：{exc}")
+                log.warning("translation: %s", _log_reason(exc))
+                self.bridge.done.emit(job, backend.join_pieces(pieces, results, target), f"翻译出错：{exc}", True)
+                return
+            seconds = time.perf_counter() - started
+            log.info("translated %d characters in %d piece(s), %.2f s, %d incomplete", len(text), len(pieces), seconds, len(broken))
+            note = f"用时 {seconds:.1f} 秒"
+            if broken:
+                listed = "、".join(str(n) for n in sorted(set(broken)))
+                note = f"第 {listed} 段没有完整译文，已在译文里用〔〕标出 · {note}"
+            self.bridge.done.emit(job, backend.join_pieces(pieces, results, target), note, bool(broken))
 
         threading.Thread(target=work, name="desk-translate", daemon=True).start()
+
+    def _note(self, text: str, warning: bool = False):
+        self.note_label.setText(text)
+        name = "warning" if warning else "muted"
+        if self.note_label.objectName() != name:
+            self.note_label.setObjectName(name)
+            self.note_label.style().unpolish(self.note_label)
+            self.note_label.style().polish(self.note_label)
 
     def on_partial(self, job: int, text: str):
         if job != self.job:
@@ -337,56 +378,79 @@ class DeskWindow(QWidget):
         self.output.setPlainText(text)
         self.output.moveCursor(QTextCursor.MoveOperation.End)
 
-    def on_done(self, job: int, text: str, note: str):
+    def on_done(self, job: int, text: str, note: str, incomplete: bool):
         if job != self.job:
             return
         self.output.setPlainText(text)
-        self.note_label.setText(note)
+        self._note(note, incomplete)
         self.copy_button.setEnabled(bool(text))
 
     def copy_output(self):
         QApplication.clipboard().setText(self.output.toPlainText())
-        self.note_label.setText("译文已复制")
+        if self.note_label.objectName() != "warning":
+            self._note("译文已复制")
 
     # ------------------------------------------------------------------ audio captions
-    def _show_audio(self, running: bool):
+    def _settle_audio(self, state: str):
+        """A request counts as done once its command has run and the gateway shows the requested state."""
+        if not self.audio_pending or self.audio_busy:
+            return
+        kind, deadline = self.audio_pending
+        if (kind == "opening" and self.audio_state in ("running", "paused")) or (kind == "closing" and state == "stopped"):
+            self.audio_pending = None
+        elif kind == "opening" and self.audio_state == "loading":
+            return  # Whisper or a cold Qwen is still loading
+        elif time.monotonic() > deadline:
+            self.audio_pending = None
+            self.audio_note = ("音频翻译没有开始字幕，请在它的窗口里查看。" if kind == "opening"
+                               else "音频翻译还没有退出，请在它的窗口里关闭。")
+
+    def _show_audio(self):
+        state = self.audio_state
         pending = self.audio_pending[0] if self.audio_pending else None
-        if pending == "opening":
-            label, button = "正在打开音频翻译，加载 Whisper…", "正在打开…"
-        elif pending == "closing":
-            label, button = "正在关闭音频翻译，释放 Whisper…", "正在关闭…"
-        elif running:
-            label, button = "音频翻译：字幕运行中，Whisper 已加载", "关闭音频翻译"
+        if pending == "closing" or state == "stopping":
+            label, button, enabled, primary = "正在关闭音频翻译，释放 Whisper…", "正在关闭…", False, False
+        elif pending == "opening" or state == "loading":
+            label, button, enabled, primary = "正在打开音频翻译，加载 Whisper…", "取消", True, False
+        elif state == "running":
+            label, button, enabled, primary = "音频翻译：字幕运行中，Whisper 已加载", "关闭音频翻译", True, False
+        elif state == "paused":
+            label, button, enabled, primary = "音频翻译：字幕已暂停，Whisper 仍在显存中", "关闭音频翻译", True, False
         else:
-            label, button = "音频翻译：未运行，不占用 Whisper 显存", "打开音频翻译"
+            label, button, enabled, primary = "音频翻译：未运行，不占用 Whisper 显存", "打开音频翻译", True, True
         self.audio_label.setText(label)
         self.audio_button.setText(button)
-        self.audio_button.setEnabled(pending is None)
-        primary = "primary" if not running and pending is None else ""
-        if self.audio_button.objectName() != primary:
-            self.audio_button.setObjectName(primary)
+        self.audio_button.setEnabled(enabled)
+        name = "primary" if primary else ""
+        if self.audio_button.objectName() != name:
+            self.audio_button.setObjectName(name)
             self.audio_button.style().unpolish(self.audio_button)  # apply the style of the new object name
             self.audio_button.style().polish(self.audio_button)
-        self.audio_hint.setText(self.audio_note or ("字幕在独立的音频翻译窗口里，关闭它会释放 Whisper，文本翻译不受影响。" if running else
-                                                    "打开后会加载 Whisper 并开始实时中文字幕。"))
+        hint = self.audio_note or ("字幕在独立的音频翻译窗口里，关闭它会释放 Whisper，文本翻译不受影响。" if state in ACTIVE
+                                   else "打开后会加载 Whisper 并开始实时中文字幕。")
+        if self.status is None and self.gateway.resolved and self.misses:
+            hint = "暂时读不到网关状态，这里显示的是最后一次的状态。"
+        self.audio_hint.setText(hint)
         if self.tray:
             self.tray_audio.setText(button)
-            self.tray_audio.setEnabled(pending is None)
+            self.tray_audio.setEnabled(enabled)
 
     def toggle_audio(self):
-        if self.audio_pending:
+        pending = self.audio_pending[0] if self.audio_pending else None
+        if pending == "closing":
             return
-        if backend.Audio.running(self.status):
+        if pending == "opening" or self.audio_state in ACTIVE:
             self.close_audio()
         else:
             self.open_audio()
 
     def open_audio(self):
-        if self.audio_pending or backend.Audio.running(self.status):
+        pending = self.audio_pending[0] if self.audio_pending else None
+        if pending == "opening" or (pending is None and self.audio_state in ACTIVE):
             return
         self.audio_note = ""
         self.audio_pending = ("opening", time.monotonic() + AUDIO_OPEN_SECONDS)
-        self._show_audio(False)
+        self._show_audio()
         log.info("opening audio captions")
         self._in_background(self.audio.open)
 
@@ -395,25 +459,32 @@ class DeskWindow(QWidget):
             return
         self.audio_note = ""
         self.audio_pending = ("closing", time.monotonic() + AUDIO_CLOSE_SECONDS)
-        self._show_audio(True)
+        self._show_audio()
         log.info("closing audio captions")
         self._in_background(self.audio.close)
 
     def _in_background(self, action):
+        """Audio commands run one at a time in the order they were given (the Audio object serialises them)."""
+        self.audio_busy += 1
+
         def work():
+            error = ""
             try:
                 action()
             except Exception as exc:  # noqa: BLE001
-                log.warning("audio control failed: %s", exc)
-                self.bridge.audio_error.emit(str(exc))
-            self.poll()
+                log.warning("audio control: %s", _log_reason(exc))
+                error = str(exc)
+            self.bridge.audio_done.emit(error)
 
         threading.Thread(target=work, name="desk-audio", daemon=True).start()
 
-    def on_audio_error(self, message: str):
-        self.audio_pending = None
-        self.audio_note = message
-        self._show_audio(backend.Audio.running(self.status))
+    def on_audio_done(self, error: str):
+        self.audio_busy -= 1
+        if error:
+            self.audio_pending = None
+            self.audio_note = error
+        self._show_audio()
+        self.poll()
 
     # ------------------------------------------------------------------ window
     def handle_command(self, command: bytes):
@@ -438,7 +509,7 @@ class DeskWindow(QWidget):
         try:
             paths.save_settings(self.settings)
         except OSError as exc:
-            log.warning("settings not saved: %s", exc)
+            log.warning("settings not saved: %s", type(exc).__name__)
 
     def quit_now(self):
         self.quitting = True
@@ -455,6 +526,8 @@ class DeskWindow(QWidget):
                 self._save()
             return
         event.accept()
+        if self.call:
+            self.call.cancel()
         log.info("desk closed; the gateway keeps serving other clients")
         QApplication.quit()
 
@@ -469,6 +542,23 @@ def setup_logging():
     root.addHandler(handler)
 
 
+def send_to_running_desk(command: bytes, seconds: float = 5) -> bool:
+    """The desk that holds the lock may still be starting its command server, so keep trying for a moment."""
+    deadline = time.monotonic() + seconds
+    while True:
+        socket = QLocalSocket()
+        socket.connectToServer(APP_KEY)
+        if socket.waitForConnected(200):
+            socket.write(command)
+            socket.flush()
+            socket.waitForBytesWritten(500)
+            socket.disconnectFromServer()
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(.1)
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     command = next((COMMANDS[arg] for arg in argv if arg in COMMANDS), b"show")
@@ -478,25 +568,32 @@ def main(argv=None) -> int:
     app.setFont(QFont("Microsoft YaHei UI", 10))
     app.setQuitOnLastWindowClosed(False)
 
-    # One desk per user: a second start passes its command to the running one.
-    socket = QLocalSocket()
-    socket.connectToServer(APP_KEY)
-    if socket.waitForConnected(300):
-        socket.write(command)
-        socket.flush()
-        socket.waitForBytesWritten(500)
-        socket.disconnectFromServer()
-        return 0
+    # One desk per user. The lock decides atomically which process becomes the desk (two quick double-clicks
+    # cannot both pass); every other start hands its command to that desk.
+    lock = QLockFile(os.path.join(QDir.tempPath(), APP_KEY + ".lock"))
+    lock.setStaleLockTime(0)  # only a lock whose process has gone is stale
+    if not lock.tryLock(0):
+        if send_to_running_desk(command):
+            return 0
+        if command in (b"quit", b"close-audio"):
+            return 0 if command == b"quit" else 1
+        QMessageBox.warning(None, "通用翻译", "另一个通用翻译窗口正在启动或没有响应，请稍后再试。")
+        return 1
     if command == b"quit":
         return 0
     if command == b"close-audio":  # no desk running: just ask the audio app to quit
-        backend.Audio().close()
+        try:
+            backend.Audio().close()
+        except backend.DeskError as exc:
+            print(exc, file=sys.stderr)
+            return 1
         return 0
 
     setup_logging()
     QLocalServer.removeServer(APP_KEY)
     server = QLocalServer()
-    server.listen(APP_KEY)
+    if not server.listen(APP_KEY):
+        raise RuntimeError(f"无法建立命令通道：{server.errorString()}")
     window = DeskWindow(backend.Gateway(), backend.Audio(), paths.load_settings(), warm="--no-warm" not in argv)
 
     def on_connection():
@@ -509,18 +606,18 @@ def main(argv=None) -> int:
     if command == b"open-audio":
         QTimer.singleShot(0, window.open_audio)
     log.info("desk started")
-    return app.exec()
+    code = app.exec()
+    lock.unlock()
+    return code
 
 
 def run():
     try:
         code = main()
-    except Exception:  # noqa: BLE001
-        log.exception("fatal")
+    except Exception as exc:  # noqa: BLE001
+        log.error("fatal: %s", type(exc).__name__)
         try:
-            import traceback
-
-            QMessageBox.critical(None, "通用翻译出错", traceback.format_exc()[-1500:] + f"\n\n日志：{paths.LOG_DIR}")
+            QMessageBox.critical(None, "通用翻译出错", f"{type(exc).__name__}：{exc}\n\n日志：{paths.LOG_DIR}")
         except Exception:  # noqa: BLE001
             pass
         code = 1

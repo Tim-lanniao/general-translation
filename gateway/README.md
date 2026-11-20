@@ -56,7 +56,7 @@ GX-120=原型机
 
 ## 文本翻译缓存
 
-`/v1/translate` 和 `/v1/chat/completions` 的完整译文会写入缓存目录的 `translation-cache.sqlite3`。缓存键是发给模型的完整请求：模型、消息、本句命中的术语、采样参数。改动本句用到的术语后它会重新翻译，改动其他词条不影响已有缓存。命中时不排队、不加载模型，响应头带 `X-Gateway-Cache: hit`。只有 `temperature` 为 0 或未填写的请求会被缓存。字幕从不进入缓存。缓存里保存原文和译文，不需要时把 `gateway_cache` 设为 `false`，或运行 `translation-gateway.cmd cache-clear` 清空。
+`/v1/translate` 和 `/v1/chat/completions` 的完整译文会写入缓存目录的 `translation-cache.sqlite3`。缓存键是发给模型的完整请求：模型、消息、本句命中的术语、采样参数。改动本句用到的术语后它会重新翻译，改动其他词条不影响已有缓存。命中时不排队、不加载模型，响应头带 `X-Gateway-Cache: hit`。只有 `temperature` 为 0 或未填写的请求会被缓存。字幕从不进入缓存；带 `Cache-Control: no-store` 请求头的请求（例如桌面入口的翻译）也不写入缓存。缓存里保存原文和译文，不需要时把 `gateway_cache` 设为 `false`，或运行 `translation-gateway.cmd cache-clear` 清空。
 
 ## 局域网里的其他设备
 

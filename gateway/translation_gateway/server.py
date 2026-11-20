@@ -34,6 +34,7 @@ LOCAL = {"localhost", "127.0.0.1", "::1"}
 EXTENSION_SCHEMES = {"chrome-extension", "moz-extension", "safari-web-extension", "extension"}
 LOCAL_ONLY = {"/v1/captions", "/sessions/open", "/sessions/heartbeat", "/sessions/close", "/admin/stop", "/admin/terms"}
 CACHEABLE = {"/v1/translate", "/v1/chat/completions"}
+CAPTION_STATES = {"loading", "running", "paused", "stopping"}
 BODY_LIMIT = 128 * 1024
 TERMS_BODY_LIMIT = 8 * 1024 * 1024
 HEADER_NAME = re.compile(r"^[A-Za-z0-9-]{1,64}$")
@@ -212,14 +213,17 @@ class Gateway:
 
     def _prune(self):
         now = time.monotonic()
-        expired = [s for s, seen in self.sessions.items() if now - seen > 90]
+        expired = [s for s, entry in self.sessions.items() if now - entry["seen"] > 90]
         for session in expired:
             del self.sessions[session]
         if expired and not self.sessions:
             self.last_used = now
             self._release_gpu()
 
-    def session(self, action, token):
+    def session(self, action, token, caption_state=None):
+        """Caption sessions; open and heartbeat may report what the caption app is doing."""
+        if caption_state is not None and caption_state not in CAPTION_STATES:
+            raise ServiceError(400, "state 应为 " + "、".join(sorted(CAPTION_STATES)))
         revision = self.terms()[1]
         with self.cv:
             self._prune()
@@ -235,9 +239,16 @@ class Gateway:
                 self.last_used = time.monotonic()
                 self._release_gpu()
             else:
-                self.sessions[token] = time.monotonic()
+                previous = self.sessions.get(token, {}).get("state", "loading")
+                self.sessions[token] = {"seen": time.monotonic(), "state": caption_state or previous}
             self.cv.notify_all()
             return {"session": token, "terms_revision": revision}
+
+    def _caption_states(self):
+        counts = {}
+        for entry in self.sessions.values():
+            counts[entry["state"]] = counts.get(entry["state"], 0) + 1
+        return counts
 
     def _active(self):
         if self.unloading:
@@ -262,8 +273,8 @@ class Gateway:
                                 "state": self._model_state(), "parallel": self.parallel,
                                 "idle_unload_s": self.cfg["gateway_idle_seconds"]},
                       "running": dict(self.running), "queued": {"captions": len(self.captions), "text": len(self.bulk)},
-                      "caption_sessions": len(self.sessions), "stopping": self.stopping,
-                      "uptime_s": round(time.monotonic() - self.started)}
+                      "caption_sessions": len(self.sessions), "caption_states": self._caption_states(),
+                      "stopping": self.stopping, "uptime_s": round(time.monotonic() - self.started)}
         report["network"] = {"lan": bool(self.cfg.get("gateway_lan")), "port": int(self.cfg["gateway_port"]),
                              "remote_networks": [str(n) for n in self.networks or LAN_NETWORKS], "devices": self.devices.count()}
         report["cache"] = {"enabled": self.cache is not None, "entries": self.cache.count() if self.cache else 0}
@@ -636,7 +647,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             text, finish, complete = result
             outcome = "ok" if complete and finish in (None, "stop") else "error"
-            if key and outcome == "ok" and text.strip():
+            # "Cache-Control: no-store" keeps this translation off the disk; cached answers may still serve it.
+            store = "no-store" not in self.headers.get("Cache-Control", "").lower()
+            if key and store and outcome == "ok" and text.strip():
                 state.cache.put(key, text, payload["model"])
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             outcome = "cancelled"
@@ -678,7 +691,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(body, dict):
                     raise ServiceError(400, "需要 JSON 对象")
                 if path in ("/sessions/open", "/sessions/heartbeat", "/sessions/close"):
-                    self._json(200, state.session(path.rsplit("/", 1)[1], body.get("session")))
+                    self._json(200, state.session(path.rsplit("/", 1)[1], body.get("session"), body.get("state")))
                 elif path == "/admin/stop":
                     state.request_stop()
                     threading.Thread(target=self.server.shutdown, daemon=True).start()

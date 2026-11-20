@@ -11,6 +11,8 @@ if not exist "%TC_PY%" (
   echo and then: .venv\Scripts\python.exe -m pip install -r requirements.txt
   exit /b 1
 )
+rem A relative data root means the folder it was started from, for every component started from here.
+if defined TRANSLATION_DATA for %%I in ("%TRANSLATION_DATA%") do set "TRANSLATION_DATA=%%~fI"
 cd /d "%~dp0"
 "%TC_PY%" -B -X utf8 -m translation_gateway %*
 exit /b %errorlevel%

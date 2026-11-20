@@ -244,6 +244,30 @@ class LanGatewayTests(unittest.TestCase):
             self.assertEqual(conn.getresponse().status, 200, listen)
             conn.close()
 
+    def test_no_store_requests_stay_off_the_disk(self):
+        self.start_gateway()
+        quiet = {"Cache-Control": "no-store"}
+        for _ in range(2):
+            status, headers, _ = self.call("POST", "/v1/translate", {"source": "Vertraulich"}, quiet)
+            self.assertEqual((status, headers["x-gateway-cache"]), (200, "miss"))
+        self.assertEqual((self.state.cache.count(), len(self.model.calls)), (0, 2))
+        self.post("/v1/translate", {"source": "Vertraulich"})  # an ordinary client stores it
+        self.assertEqual(self.state.cache.count(), 1)
+        self.assertEqual(self.call("POST", "/v1/translate", {"source": "Vertraulich"}, quiet)[1]["x-gateway-cache"], "hit")
+
+    def test_caption_sessions_report_their_state(self):
+        self.start_gateway()
+        session = self.post("/sessions/open", {})["session"]
+        self.assertEqual(self.state.status_report()["caption_states"], {"loading": 1})
+        self.post("/sessions/heartbeat", {"session": session, "state": "running"})
+        self.post("/sessions/heartbeat", {"session": session})  # a plain heartbeat keeps the state
+        self.assertEqual(self.state.status_report()["caption_states"], {"running": 1})
+        with self.assertRaisesRegex(RuntimeError, "400"):
+            self.post("/sessions/heartbeat", {"session": session, "state": "dancing"})
+        self.post("/sessions/close", {"session": session})
+        report = self.state.status_report()
+        self.assertEqual((report["caption_sessions"], report["caption_states"]), (0, {}))
+
     def test_cache_serves_repeats_without_the_model(self):
         self.start_gateway()
         request = {"source": "Guten Tag", "source_language": "de"}
