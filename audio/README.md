@@ -20,8 +20,8 @@
 需要 Windows、NVIDIA CUDA、Python 3.12，以及能提供 OpenAI 风格文本推理接口的本地模型。跨设备采集要求 Windows build 20348 或更高。作者的配置为 faster-whisper large-v3-turbo FP16 和 Strata 上的 Qwen3.8-Flash-Next IQ3_S，运行中整卡显存曾达到约 21 GiB。
 
 ```powershell
-git clone https://github.com/Tim-lanniao/teams-live-caption
-cd teams-live-caption\audio
+git clone https://github.com/Tim-lanniao/general-translation
+cd general-translation\audio
 powershell -ExecutionPolicy Bypass -File setup.ps1
 New-Item -ItemType Directory -Force ..\data\audio, ..\data\gateway | Out-Null
 Copy-Item config.example.json ..\data\audio\config.json
