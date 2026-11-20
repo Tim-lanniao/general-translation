@@ -43,9 +43,10 @@ check("CUDA DLLs (cuBLAS 12 / cuDNN 9)", any((d / "cublas64_12.dll").is_file() f
 check("LLM controller (optional)", Path(cfg["llm_controller"]).is_file() if cfg["llm_controller"] else False,
       cfg["llm_controller"] or f"not set: start {cfg['llm_url']} yourself", required=False)
 
-from teams_caption import capture  # noqa: E402
+from teams_caption import capture, gateway_access  # noqa: E402
 
 devices = capture.list_render_devices()
 check("Playback devices", bool(devices), "; ".join(d.name + (" (default)" if d.default else "") for d in devices))
-print(f"[info] audio source: {cfg['source']} | gateway: 127.0.0.1:{cfg['gateway_port']}")
+lan = f"LAN on, {len(gateway_access.list_devices())} device token(s), parallel {cfg['llm_parallel']}" if cfg["gateway_lan"] else "this PC only"
+print(f"[info] audio source: {cfg['source']} | gateway: port {cfg['gateway_port']}, {lan}")
 sys.exit(0 if ok else 1)
