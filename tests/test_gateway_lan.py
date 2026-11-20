@@ -56,7 +56,7 @@ class Model(BaseHTTPRequestHandler):
                     time.sleep(.03)
             self.wfile.write(b"data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]}).encode() + b"\n\n")
             self.wfile.write(b"data: [DONE]\n\n")
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:  # Windows reports a closed peer as ConnectionAbortedError
             server.aborted.set()
         finally:
             with server.lock:
