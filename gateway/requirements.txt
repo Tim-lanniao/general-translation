@@ -1,0 +1,2 @@
+# The gateway needs only the standard library and this package.
+filelock==4.2.10

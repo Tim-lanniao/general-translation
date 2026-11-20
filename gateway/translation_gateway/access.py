@@ -27,7 +27,7 @@ LAN_NETWORKS = [ipaddress.ip_network(n) for n in
 
 
 def devices_path() -> Path:
-    return config.DATA_DIR / "gateway-devices.json"
+    return config.DATA_DIR / "devices.json"
 
 
 def _digest(token: str) -> str:
@@ -65,7 +65,7 @@ def _write(devices: list[dict]) -> None:
 
 def _lock() -> FileLock:
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    return FileLock(str(config.DATA_DIR / "gateway-devices.lock"), timeout=5)
+    return FileLock(str(config.DATA_DIR / "devices.lock"), timeout=5)
 
 
 def add_device(name: str) -> str:

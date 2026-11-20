@@ -1,4 +1,4 @@
-"""Translation gateway: one local model shared by captions and text clients on this PC and the LAN."""
+"""Translation gateway: one local model shared by audio captions and text clients on this PC and the LAN."""
 from __future__ import annotations
 
 import argparse
@@ -23,17 +23,17 @@ from urllib.parse import urlsplit
 from filelock import FileLock, Timeout
 
 from . import config
-from .gateway_access import (LAN_NETWORKS, DeviceRegistry, add_device, list_devices, parse_networks, peer_address,
-                             remote_allowed, revoke_device)
-from .gateway_cache import TranslationCache
-from .glossary import Glossary
-from .model_runtime import ModelRuntime
-from .translate import ensure_gateway, gateway_url, request_json, status
+from .access import (LAN_NETWORKS, DeviceRegistry, add_device, list_devices, parse_networks, peer_address,
+                     remote_allowed, revoke_device)
+from .cache import TranslationCache
+from .client import SERVICE, ensure_gateway, gateway_url, request_json, status
+from .runtime import ModelRuntime
+from .terms import Glossary
 
 log = logging.getLogger(__name__)
 LOCAL = {"localhost", "127.0.0.1", "::1"}
 EXTENSION_SCHEMES = {"chrome-extension", "moz-extension", "safari-web-extension", "extension"}
-LOCAL_ONLY = {"/v1/captions", "/sessions/open", "/sessions/heartbeat", "/sessions/close", "/admin/stop"}
+LOCAL_ONLY = {"/v1/captions", "/sessions/open", "/sessions/heartbeat", "/sessions/close", "/admin/stop", "/admin/terms"}
 CACHEABLE = {"/v1/translate", "/v1/chat/completions"}
 HEADER_NAME = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
@@ -183,6 +183,7 @@ class Gateway:
         self.gpu = FileLock(cfg["gpu_lock"], timeout=0, thread_local=False) if cfg.get("gpu_lock") else None
         self.glossary = Glossary("", phonetic=False)
         self.revision = object()
+        self.terms_hash = ""
         self.glossary_lock = threading.Lock()
         self.networks = parse_networks(cfg.get("gateway_networks"))
         self.devices = DeviceRegistry()
@@ -218,6 +219,7 @@ class Gateway:
             self._release_gpu()
 
     def session(self, action, token):
+        revision = self.terms()[1]
         with self.cv:
             self._prune()
             if self.stopping:
@@ -234,7 +236,7 @@ class Gateway:
             else:
                 self.sessions[token] = time.monotonic()
             self.cv.notify_all()
-            return {"session": token}
+            return {"session": token, "terms_revision": revision}
 
     def _active(self):
         if self.unloading:
@@ -247,14 +249,14 @@ class Gateway:
     def info(self):
         with self.cv:
             self._prune()
-            return {"service": "audio-translation", "model": self.cfg["llm_model"], "loaded": self.loaded,
+            return {"service": SERVICE, "model": self.cfg["llm_model"], "loaded": self.loaded,
                     "active": self._active(), "caption_sessions": len(self.sessions), "queued_captions": len(self.captions),
                     "queued_text": len(self.bulk), "stopping": self.stopping}
 
     def status_report(self):
         with self.cv:
             self._prune()
-            report = {"service": "audio-translation",
+            report = {"service": SERVICE,
                       "model": {"id": self.cfg["llm_model"], "label": self.cfg.get("llm_label") or self.cfg["llm_model"],
                                 "state": self._model_state(), "parallel": self.parallel,
                                 "idle_unload_s": self.cfg["gateway_idle_seconds"]},
@@ -264,6 +266,8 @@ class Gateway:
         report["network"] = {"lan": bool(self.cfg.get("gateway_lan")), "port": int(self.cfg["gateway_port"]),
                              "remote_networks": [str(n) for n in self.networks or LAN_NETWORKS], "devices": self.devices.count()}
         report["cache"] = {"enabled": self.cache is not None, "entries": self.cache.count() if self.cache else 0}
+        glossary, revision = self.terms()
+        report["terms"] = {"entries": len(glossary.entries), "revision": revision}
         report["clients"] = self.stats.snapshot()
         return report
 
@@ -306,14 +310,26 @@ class Gateway:
                 self._release_gpu()
                 self.cv.notify_all()
 
-    def build(self, path, body):
-        revision = config.shared_terms_revision()
+    def terms(self, *, reload=False):
+        """The shared glossary and its content hash, reread after every change of the file."""
+        revision = config.terms_revision()
         with self.glossary_lock:
-            if self.revision != revision:
-                self.glossary = Glossary(config.read_shared_terms(self.cfg), phonetic=False)
+            if reload or self.revision != revision:
+                raw = config.read_terms()
+                self.glossary = Glossary(raw, phonetic=False)
+                self.terms_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
                 self.revision = revision
-            glossary = self.glossary
-        return translation_request(path, body, self.cfg, glossary)
+            return self.glossary, self.terms_hash
+
+    def save_terms(self, raw):
+        if not isinstance(raw, str):
+            raise ServiceError(400, "terms 应为文本")
+        config.save_terms(raw)
+        glossary, revision = self.terms(reload=True)
+        return {"revision": revision, "entries": len(glossary.entries)}
+
+    def build(self, path, body):
+        return translation_request(path, body, self.cfg, self.terms()[0])
 
     def ensure_loaded(self):
         with self.load_lock:
@@ -582,6 +598,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, state.status_report())
             elif self.command == "GET" and path == "/v1/models":
                 self._json(200, {"object": "list", "data": [{"id": state.cfg["llm_model"], "object": "model", "owned_by": "local"}]})
+            elif self.command == "GET" and path == "/admin/terms":
+                glossary, revision = state.terms()
+                self._json(200, {"terms": glossary.raw, "revision": revision, "entries": len(glossary.entries)})
             elif self.command == "POST":
                 length = int(self.headers.get("Content-Length", 0))
                 if self.headers.get_content_type() != "application/json":
@@ -597,6 +616,8 @@ class Handler(BaseHTTPRequestHandler):
                     state.request_stop()
                     threading.Thread(target=self.server.shutdown, daemon=True).start()
                     self._json(200, {"stopping": True})
+                elif path == "/admin/terms":
+                    self._json(200, state.save_terms(body.get("terms")))
                 elif path in ("/v1/captions", "/v1/translate", "/v1/chat/completions"):
                     self._translate(state, client, path, body)
                 else:
@@ -627,7 +648,6 @@ def serve(cfg):
         runtime = ModelRuntime(cfg, log.info)
         if cfg.get("llm_controller") and runtime.ready():
             raise RuntimeError("检测到独立运行的 Qwen，请先从测试入口停止模型")
-        config.save_shared_terms(cfg.get("terms", ""), initialize=True)
         state = Gateway(cfg, runtime)
         host = "0.0.0.0" if cfg.get("gateway_lan") else "127.0.0.1"
         if cfg.get("gateway_lan") and not state.devices.count():
@@ -694,11 +714,11 @@ def device_control(cfg, action, name):
     print(token)
     print(f"客户端设置：Base URL http://<这台电脑的局域网 IP>:{int(cfg['gateway_port'])}/v1 ，API Key 填上面的 token。")
     if not cfg.get("gateway_lan"):
-        print("提示：config.json 中 gateway_lan 仍为 false，改为 true 并重启网关后其他设备才能连接。")
+        print(f"提示：{config.CONFIG_PATH} 中 gateway_lan 仍为 false，改为 true 并重启网关后其他设备才能连接。")
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Local audio/text translation gateway")
+    parser = argparse.ArgumentParser(prog="translation-gateway", description="Local translation gateway for audio and text clients")
     parser.add_argument("action", choices=["serve", "start", "stop", "status", "test-start", "test-stop", "test-check",
                                            "token-add", "token-list", "token-revoke", "cache-clear"])
     parser.add_argument("name", nargs="?", help="设备名（token-add / token-revoke）")

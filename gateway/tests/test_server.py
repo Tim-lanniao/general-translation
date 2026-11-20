@@ -1,21 +1,17 @@
 import json
-import os
-import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from unittest.mock import Mock, patch
 
 from filelock import Timeout
 
-from teams_caption import config
-from teams_caption.capture import LoopbackCapture
-from teams_caption.engine import source_spec
-from teams_caption.gateway import Gateway, Server, mode_lock, test_control as control
-from teams_caption.translate import GatewayTranslator, gateway_url, request_json, _stream_chat
+from support import isolated_data
+from translation_gateway import config
+from translation_gateway.client import gateway_url, request_json, stream_chat
+from translation_gateway.server import Gateway, Server, mode_lock, test_control as control
 
 
 def wait_for(condition):
@@ -51,13 +47,8 @@ class FakeModel(BaseHTTPRequestHandler):
 
 class GatewayTests(unittest.TestCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.folder = Path(tmp.name)
-        for key, value in (("DATA_DIR", self.folder), ("CONFIG_PATH", self.folder / "config.json")):
-            p = patch.object(config, key, value)
-            p.start()
-            self.addCleanup(p.stop)
+        self.folder = isolated_data(self)
+        self.folder.mkdir(parents=True)
         self.up = ThreadingHTTPServer(("127.0.0.1", 0), FakeModel)
         self.up.calls = []
         self.up.unblock = threading.Event()
@@ -79,7 +70,7 @@ class GatewayTests(unittest.TestCase):
         return request_json(self.cfg, path, body)
 
     def test_mixed_clients_one_slot_streaming_and_error_recovery(self):
-        config.save_shared_terms("Presse=压力机\nGX-100=样机")
+        config.save_terms("Presse=压力机\nGX-100=样机")
         session = self.post("/sessions/open", {})["session"]
         self.addCleanup(self.state.session, "close", session)
         with ThreadPoolExecutor(3) as pool:
@@ -89,7 +80,7 @@ class GatewayTests(unittest.TestCase):
                                "chat_template_kwargs": {"enable_thinking": True}, "reasoning_effort": "high"})
             wait_for(lambda: self.state.info()["queued_text"] == 1)
             previews = []
-            live = pool.submit(_stream_chat, gateway_url(self.cfg) + "/v1/captions",
+            live = pool.submit(stream_chat, gateway_url(self.cfg) + "/v1/captions",
                                {"source": "Die Presse", "session": session, "stream": True}, on_partial=previews.append)
             wait_for(lambda: self.state.info()["queued_captions"] == 1)
             self.assertEqual(len(self.up.calls), 1)
@@ -105,19 +96,17 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(all(p["chat_template_kwargs"] == {"enable_thinking": False} for p in self.up.calls))
         with self.assertRaisesRegex(RuntimeError, "503"):
             self.post("/v1/translate", {"source": "error"})
-        config.save_shared_terms("Presse=压机")
+        config.save_terms("Presse=压机")
         self.post("/v1/translate", {"source": "Presse"})
         self.assertIn("Presse=压机", self.up.calls[-1]["messages"][0]["content"])
 
-    def test_frontend_close_idle_unload_and_reload(self):
-        client = GatewayTranslator(self.cfg)
-        with patch("teams_caption.translate.ensure_gateway"):
-            client.start(lambda _: None)
+    def test_session_close_idle_unload_and_reload(self):
+        session = self.post("/sessions/open", {})["session"]
         self.assertTrue(self.state.gpu.is_locked)
-        client.translate("Hallo", "", "")
+        stream_chat(gateway_url(self.cfg) + "/v1/captions", {"source": "Hallo", "session": session, "stream": True})
         with self.assertRaisesRegex(RuntimeError, "409"):
             self.post("/admin/stop", {})
-        client.stop()
+        self.post("/sessions/close", {"session": session})
         self.runtime.stop.assert_not_called()
         self.assertTrue(self.state.info()["loaded"])
         monitor = threading.Thread(target=self.state.maintain)
@@ -163,7 +152,7 @@ class GatewayTests(unittest.TestCase):
     def test_exclusive_mode_and_failed_stop_recovery(self):
         cfg = dict(self.cfg, llm_controller="configured")
         runtime = Mock()
-        with patch("teams_caption.gateway.ModelRuntime", return_value=runtime):
+        with patch("translation_gateway.server.ModelRuntime", return_value=runtime):
             with mode_lock(), self.assertRaises(Timeout):
                 control(cfg, "test-start")
             with self.assertRaises(RuntimeError):
@@ -179,19 +168,6 @@ class GatewayTests(unittest.TestCase):
             control(cfg, "test-stop")
             self.assertFalse((self.folder / "model-test.active").exists())
 
-    def test_audio_default_migration_and_cross_endpoint_selection(self):
-        config.CONFIG_PATH.write_text(json.dumps({"source": "device:default", "translator": "hymt7b"}))
-        self.assertEqual((config.load()["source"], config.load()["translator"]), ("system", "qwen"))
-        config.CONFIG_PATH.write_text(json.dumps({"source": "device:custom", "terms": "Messe=展会"}))
-        cfg = config.load()
-        self.assertEqual(cfg["source"], "device:custom")
-        config.save_shared_terms(cfg["terms"], initialize=True)
-        config.save_shared_terms("andere", initialize=True)
-        self.assertEqual(config.read_shared_terms(cfg), "Messe=展会")
-        capture = LoopbackCapture(source_spec("system"), Mock(), Mock())
-        with patch("teams_caption.capture._activate_process_loopback", return_value=17) as activate:
-            self.assertEqual(capture._open()[::2], (17, os.getpid()))
-            activate.assert_called_once_with(os.getpid(), exclude=True)
-        with patch("teams_caption.capture._activate_process_loopback", side_effect=OSError), \
-                patch("teams_caption.capture._activate_device", return_value=(23, "speakers")):
-            self.assertEqual(capture._open()[::2], (23, None))
+
+if __name__ == "__main__":
+    unittest.main()
