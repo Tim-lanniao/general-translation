@@ -21,12 +21,12 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,  # noqa: E402
                                QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSplitter, QTextBrowser, QToolButton, QVBoxLayout, QWidget)
 
-from . import capture  # noqa: E402
+from . import capture, translator  # noqa: E402
 from .engine import CaptionEngine, gpu_memory  # noqa: E402
 from .overlay import CaptionOverlay  # noqa: E402
 
-log = logging.getLogger("teams_caption")
-APP_KEY = "TeamsLiveCaption-" + os.environ.get("USERNAME", "user")
+log = logging.getLogger("audio_caption")
+APP_KEY = "TeamsLiveCaption-" + os.environ.get("USERNAME", "user")  # unchanged, so old and new builds stay single-instance
 
 STYLE = """
 QWidget#root { background: #F3F6F4; }
@@ -160,7 +160,6 @@ class ControlWindow(QWidget):
         self.history_text: list[str] = []
         self.record_dir = ""
         self.closing = False
-        config.save_shared_terms(self.cfg.get("terms", ""), initialize=True)
         self._build()
         self.refresh_sources()
         self.set_state("idle", "未启动 · 点击「开始字幕」")
@@ -451,7 +450,15 @@ class ControlWindow(QWidget):
                            if shared else "每行填写一个德语人名或术语。用 [展会] 等标题分组，内容主题包含组名时优先识别。")
         help_text.setWordWrap(True)
         layout.addWidget(help_text)
-        editor = QPlainTextEdit(config.read_shared_terms(self.cfg) if shared else self.cfg.get("terms", ""))
+        if shared:  # the gateway owns the shared glossary
+            try:
+                current = translator.read_shared_terms()["terms"]
+            except (OSError, RuntimeError) as exc:
+                QMessageBox.warning(self, "共享翻译术语", f"无法连接翻译网关：{exc}")
+                return
+        else:
+            current = self.cfg.get("terms", "")
+        editor = QPlainTextEdit(current)
         editor.setPlaceholderText("Frau Schäfer=舍费尔女士\n[展会]\nSpritzguss=注塑\nWerkzeugabnahme=模具验收")
         layout.addWidget(editor)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -463,7 +470,13 @@ class ControlWindow(QWidget):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             raw = editor.toPlainText().strip()
             if shared:
-                config.save_shared_terms(raw)
+                try:
+                    saved = translator.save_shared_terms(raw)
+                except (OSError, RuntimeError) as exc:
+                    QMessageBox.warning(self, "共享翻译术语", f"术语没有保存：{exc}")
+                    return
+                if self.engine.translator:  # retranslate the current sentence with the new terms
+                    self.engine.translator.terms_revision = saved["revision"]
             else:
                 self.save_setting("terms", raw)
 
@@ -726,7 +739,7 @@ class ControlWindow(QWidget):
 
 def setup_logging():
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
-    h = logging.handlers.RotatingFileHandler(config.LOG_DIR / "teams-caption.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    h = logging.handlers.RotatingFileHandler(config.LOG_DIR / "audio-caption.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
     h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(threadName)s %(message)s"))
     root = logging.getLogger()
     root.setLevel(logging.INFO)
@@ -790,7 +803,7 @@ def run():
     try:
         code = main()
     except Exception:
-        logging.getLogger("teams_caption").exception("fatal")
+        logging.getLogger("audio_caption").exception("fatal")
         try:
             import traceback
 

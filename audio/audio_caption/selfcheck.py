@@ -1,12 +1,14 @@
-"""Environment check (no GPU model is loaded). Run: python -m teams_caption.selfcheck"""
+"""Environment check (no GPU model is loaded). Run: python -m audio_caption.selfcheck"""
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from teams_caption import config  # noqa: E402
+from audio_caption import config  # noqa: E402
+from translation_gateway import config as gateway_config  # noqa: E402
 
 cfg = config.load()
+gateway = gateway_config.load()
 config.prepare_environment(cfg)
 ok = True
 
@@ -19,7 +21,7 @@ def check(name, cond, detail="", required=True):
         ok &= bool(cond)
 
 
-print(f"[info] data directory: {config.DATA_DIR}")
+print(f"[info] data directories: {config.DATA_DIR} | gateway {gateway_config.DATA_DIR}")
 try:
     import PySide6  # noqa: F401
     import ctranslate2
@@ -35,18 +37,18 @@ except Exception as exc:  # noqa: BLE001
     check("Python packages", False, repr(exc))
 
 model = Path(cfg["asr_model_dir"])
-model = model if model.is_absolute() else config.REPO / model
+model = model if model.is_absolute() else config.COMPONENT / model
 check("ASR model large-v3-turbo", (model / "model.bin").is_file(), str(model))
 dlls = config.cuda_dll_dirs(cfg)
 check("CUDA DLLs (cuBLAS 12 / cuDNN 9)", any((d / "cublas64_12.dll").is_file() for d in dlls) or not dlls,
       "; ".join(map(str, dlls)) or "not configured, relying on PATH")
-check("LLM controller (optional)", Path(cfg["llm_controller"]).is_file() if cfg["llm_controller"] else False,
-      cfg["llm_controller"] or f"not set: start {cfg['llm_url']} yourself", required=False)
+check("LLM controller of the gateway (optional)", Path(gateway["llm_controller"]).is_file() if gateway["llm_controller"] else False,
+      gateway["llm_controller"] or f"not set: start {gateway['llm_url']} yourself", required=False)
 
-from teams_caption import capture, gateway_access  # noqa: E402
+from audio_caption import capture  # noqa: E402
 
 devices = capture.list_render_devices()
 check("Playback devices", bool(devices), "; ".join(d.name + (" (default)" if d.default else "") for d in devices))
-lan = f"LAN on, {len(gateway_access.list_devices())} device token(s), parallel {cfg['llm_parallel']}" if cfg["gateway_lan"] else "this PC only"
-print(f"[info] audio source: {cfg['source']} | gateway: port {cfg['gateway_port']}, {lan}")
+lan = "LAN on" if gateway["gateway_lan"] else "this PC only"
+print(f"[info] audio source: {cfg['source']} | gateway: port {gateway['gateway_port']}, {lan}, parallel {gateway['llm_parallel']}")
 sys.exit(0 if ok else 1)

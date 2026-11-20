@@ -1,0 +1,13 @@
+{
+  "asr_model_dir": "models\\faster-whisper-large-v3-turbo",
+  "cuda_dll_dir": "",
+  "cache_dir": "",
+  "source": "system",
+  "asr_language": "de",
+  "sample_wav": "",
+  "first_update_seconds": 1.4,
+  "vad_punctuated_silence_ms": 384,
+  "vad_final_silence_ms": 600,
+  "topic": "",
+  "terms": ""
+}

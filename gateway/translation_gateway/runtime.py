@@ -5,7 +5,10 @@ import time
 import urllib.request
 from pathlib import Path
 
-NO_WINDOW = subprocess.CREATE_NO_WINDOW
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# Existing controller scripts check AUDIO_TRANSLATION_CONTROLLER to tell the gateway's own
+# start/stop from a manual test start, so both names are set.
+CONTROLLER_ENV = {"TRANSLATION_GATEWAY_CONTROLLER": "1", "AUDIO_TRANSLATION_CONTROLLER": "1"}
 
 
 def _http_ok(url: str, timeout: float = 1.0) -> bool:
@@ -33,7 +36,7 @@ class ModelRuntime:
             raise FileNotFoundError(f"找不到翻译服务启动脚本：{script}")
         out = subprocess.run(
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), action],
-            env={**os.environ, "AUDIO_TRANSLATION_CONTROLLER": "1"}, capture_output=True, text=True,
+            env={**os.environ, **CONTROLLER_ENV}, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=timeout, creationflags=NO_WINDOW,
         )
         text = (out.stdout or "") + (out.stderr or "")

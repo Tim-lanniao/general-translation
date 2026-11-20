@@ -29,10 +29,10 @@ import numpy as np
 
 from . import config
 from .capture import LoopbackCapture, SourceSpec
-from .glossary import Glossary
+from .hotwords import Hotwords
 
 SR = 16000
-log = logging.getLogger("teams_caption")
+log = logging.getLogger("audio_caption")
 
 # Typical Whisper hallucinations on German silence/noise (TV subtitle credits etc.).
 HALLUCINATION = re.compile(
@@ -332,7 +332,7 @@ class CaptionEngine:
         self.lat = collections.deque(maxlen=30)       # pause-final lag (speech end -> final caption)
         self.prov_lat = collections.deque(maxlen=30)  # provisional lag (newest audio -> caption)
         self.count = 0
-        self._terms = Glossary(cfg.get("terms", ""))
+        self._terms = Hotwords(cfg.get("terms", ""))
         self.prompt_key, self.prompt = None, None
         self.candidate = None
         self.last_attempt = None
@@ -357,7 +357,7 @@ class CaptionEngine:
 
     def _load_and_run(self):
         try:
-            from .translate import GatewayTranslator
+            from .translator import GatewayTranslator
 
             self.translator = GatewayTranslator(self.cfg)
             self.translator.start(lambda text: self._status("loading", text))
@@ -368,7 +368,7 @@ class CaptionEngine:
 
             model_dir = Path(self.cfg["asr_model_dir"])
             if not model_dir.is_absolute():
-                model_dir = config.REPO / model_dir
+                model_dir = config.COMPONENT / model_dir
             if not (model_dir / "model.bin").is_file():
                 raise FileNotFoundError(f"找不到语音识别模型：{model_dir}（运行 setup.ps1 下载，或在 config.json 设置 asr_model_dir）")
             self.model = WhisperModel(str(model_dir), device="cuda", compute_type="float16", cpu_threads=8, num_workers=1, local_files_only=True)
@@ -596,7 +596,7 @@ class CaptionEngine:
         raw = self.cfg.get("terms", "")
         glossary = self._terms
         if raw != glossary.raw:
-            glossary = self._terms = Glossary(raw)
+            glossary = self._terms = Hotwords(raw)
         return glossary
 
     def _recognition_prompt(self):
@@ -636,7 +636,7 @@ class CaptionEngine:
         aliases = ()
         if language in ("de", "auto") and self.glossary.entries:
             aliases = tuple(t.source for t in self.glossary.matches(source, topic, near_only=True))[:12]
-        key = (*args, language, aliases, config.shared_terms_revision())
+        key = (*args, language, aliases, self.translator.terms_revision)  # a glossary edit retranslates
         if self.mt_key == key:
             return self.mt_text, 0.0
 

@@ -1,0 +1,14 @@
+{
+  "llm_url": "http://127.0.0.1:18081",
+  "llm_model": "qwen3.8-flash-next-iq3_s",
+  "llm_label": "Qwen3.8-Flash-Next",
+  "llm_controller": "",
+  "llm_parallel": 1,
+  "gateway_port": 18083,
+  "gateway_idle_seconds": 300,
+  "gateway_lan": false,
+  "gateway_networks": [],
+  "gateway_cache": true,
+  "gpu_lock": "",
+  "cache_dir": ""
+}

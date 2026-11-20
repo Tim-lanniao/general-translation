@@ -36,6 +36,6 @@ if (-not $VerifyOnly) {
         }
     }
 }
-& $python (Join-Path $PSScriptRoot 'teams_caption\selfcheck.py')
+& $python (Join-Path $PSScriptRoot 'audio_caption\selfcheck.py')
 if ($LASTEXITCODE -ne 0) { throw 'Self-check failed; see the [FAIL] lines above.' }
-Write-Host 'Ready. Configure the translation gateway (see README), then double-click the audio caption launcher.'
+Write-Host 'Ready. Configure the translation gateway (..\gateway\README.md), then double-click the audio caption launcher.'

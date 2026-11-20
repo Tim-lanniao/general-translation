@@ -10,9 +10,10 @@ from unittest.mock import Mock, patch
 import numpy as np
 from scipy.signal import resample_poly
 
-from teams_caption.capture import StreamResampler
-from teams_caption.engine import AudioRing, CaptionEngine, CausalVAD, Job, SR, sentence_ended
-from teams_caption.translate import _stream_chat
+import audio_caption  # noqa: F401  (puts ../gateway on sys.path when run from a checkout)
+from audio_caption.capture import StreamResampler
+from audio_caption.engine import AudioRing, CaptionEngine, CausalVAD, Job, SR, sentence_ended
+from translation_gateway.client import stream_chat
 
 
 class LiveTranslationTests(unittest.TestCase):
@@ -26,20 +27,20 @@ class LiveTranslationTests(unittest.TestCase):
                                              {"content": "议改到"}, {"content": "周二。"}))
         previews = []
         url = "http://localhost/v1/chat/completions"
-        with patch("teams_caption.translate.urllib.request.build_opener") as opener:
+        with patch("translation_gateway.client.urllib.request.build_opener") as opener:
             opener.return_value.open.return_value = io.BytesIO(stream + b"data: [DONE]\n")
-            full, _, _ = _stream_chat(url, {}, on_partial=previews.append)
+            full, _, _ = stream_chat(url, {}, on_partial=previews.append)
             self.assertEqual(full, "会议改到周二。")
             self.assertEqual(previews, ["会", "会议改到", "会议改到周二。"])
             opener.return_value.open.return_value = io.BytesIO(stream + b'data: {"error":"interrupted"}\n\ndata: [DONE]\n')
             with self.assertRaisesRegex(RuntimeError, "interrupted"):
-                _stream_chat(url, {})
+                stream_chat(url, {})
             opener.return_value.open.return_value = io.BytesIO(stream)
             with self.assertRaises(RuntimeError):
-                _stream_chat(url, {})
+                stream_chat(url, {})
             opener.return_value.open.return_value = io.BytesIO(stream + b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n')
             with self.assertRaises(RuntimeError):
-                _stream_chat(url, {})
+                stream_chat(url, {})
 
     def test_preview_cache_and_final_record(self):
         events = []
@@ -70,9 +71,9 @@ class LiveTranslationTests(unittest.TestCase):
         eng.cfg["terms"] = "Dienstag"
         eng._translate(job, "1.0", de, 0, SR)
         eng.translator.translate.assert_called_once()
-        with patch("teams_caption.config.shared_terms_revision", return_value=(1, 1, 1)):
-            eng._translate(job, "1.0", de, 0, SR)
-            eng._translate(job, "1.0", de, 0, SR)
+        eng.translator.terms_revision = "edited"  # reported by the gateway after a glossary edit
+        eng._translate(job, "1.0", de, 0, SR)
+        eng._translate(job, "1.0", de, 0, SR)
         self.assertEqual(eng.translator.translate.call_count, 2)
 
     def test_packet_resampling_matches_whole_audio(self):
@@ -280,26 +281,26 @@ class LiveTranslationTests(unittest.TestCase):
 
     def test_term_edits_during_pause_revalidate_asr_and_mt_independently(self):
         for change_shared in (True, False):
-            with self.subTest(shared=change_shared), patch("teams_caption.config.shared_terms_revision") as revision:
-                revision.return_value = 1
+            with self.subTest(shared=change_shared):
                 eng = self.make_engine()
+                eng.translator.terms_revision = 1
                 eng.cfg["terms"] = "Presse"
                 eng.model = Mock()
                 eng.model.hf_tokenizer.encode.return_value = SimpleNamespace(ids=[1])
                 eng._asr = Mock(return_value=("Die Presse.", [], .1))
-                eng.translator.translate.side_effect = lambda *a, **kw: dict(translation=str(revision.return_value), mt_s=.2)
+                eng.translator.translate.side_effect = lambda *a, **kw: dict(translation=str(eng.translator.terms_revision), mt_s=.2)
                 self.frames(eng, 0.8, 34)
                 self.frames(eng, 0.1)
                 eng._provisional(eng._next_job())
                 if change_shared:
-                    revision.return_value = 2
+                    eng.translator.terms_revision = 2
                 else:
                     eng.cfg["terms"] += "\nMesse"
                 self.frames(eng, 0.1, 19)
                 eng._final(eng._next_job())
                 self.assertEqual(eng._asr.call_count, 1 if change_shared else 2)
                 self.assertEqual(eng.translator.translate.call_count, 2 if change_shared else 1)
-                self.assertEqual(eng.recorder.add.call_args.args[0]["zh"], str(revision.return_value))
+                self.assertEqual(eng.recorder.add.call_args.args[0]["zh"], str(eng.translator.terms_revision))
 
     def test_only_sentence_end_marks_allow_short_endpoint(self):
         for text in ("Liefern Sie?", "Alles erledigt.“", "Gut!"):

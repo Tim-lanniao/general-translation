@@ -1,23 +1,24 @@
-"""Paths and persisted settings.
+"""Paths and persisted settings of the audio caption app.
 
-Everything machine-specific (model paths, CUDA DLLs, the local LLM server, a shared
-GPU lock) lives in ``config.json`` inside the data directory, which is never part of
-the repository. See ``config.example.json``.
+Everything machine-specific (model paths, CUDA DLLs, a shared GPU lock) lives in
+``config.json`` inside the data directory, which is never part of the repository. See
+``config.example.json``. Translation model settings belong to the gateway
+(``<data root>/gateway/config.json``).
 
-Data directory: ``%TEAMS_CAPTION_DATA%`` if set, otherwise ``<repo>/data``.
+Data directory: ``<data root>/audio``, with the data root shared with the gateway
+(``%TRANSLATION_DATA%``, else ``%TEAMS_CAPTION_DATA%``, else ``<repo>/data``).
 """
 from __future__ import annotations
 
 import json
 import os
 import sys
-import tempfile
 from pathlib import Path
 
-from filelock import FileLock
+from translation_gateway import config as gateway_config
 
-REPO = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(os.environ.get("TEAMS_CAPTION_DATA") or REPO / "data")
+COMPONENT = Path(__file__).resolve().parent.parent
+DATA_DIR = gateway_config.ROOT / "audio"
 RECORD_DIR = DATA_DIR / "会议记录"
 LOG_DIR = DATA_DIR / "logs"
 CONFIG_PATH = DATA_DIR / "config.json"
@@ -36,8 +37,8 @@ DEFAULTS = {
     "audio_source_version": 2,
     "asr_language": "de",
     "translator": "qwen",
-    "topic": "",                 # meeting subject, used in the translation prompt
-    "terms": "",                 # German=Chinese lines, optional [scene] sections
+    "topic": "",                 # meeting subject, sent with every caption translation
+    "terms": "",                 # recognition hotwords: German names, optional [scene] sections
     "auto_start": True,
     "show_german": True,
     "font_px": 28,
@@ -49,13 +50,6 @@ DEFAULTS = {
     "auto_collapse_settings": True,
     "history_font_px": 16,
     "idle_release_minutes": 45,
-    "gateway_port": 18083,
-    "gateway_idle_seconds": 300,
-    "gateway_lan": False,        # also listen on the LAN; remote clients need a device token
-    "gateway_networks": [],      # remote client networks in CIDR; empty = private LAN ranges
-    "gateway_cache": True,       # reuse finished text translations (captions are never cached)
-    "gateway_cache_entries": 20000,
-    "llm_parallel": 1,           # generations the inference server runs at once (Strata parallel requests)
     # ---- pipeline (values from the author's real-time replay evaluation)
     "window_seconds": 12,
     "update_seconds": 2,
@@ -65,19 +59,21 @@ DEFAULTS = {
     "beam_size": 5,
     "context_chars": 160,
     # ---- machine-specific paths (set in config.json; see config.example.json)
-    "asr_model_dir": str(REPO / "models" / "faster-whisper-large-v3-turbo"),
+    "asr_model_dir": str(COMPONENT / "models" / "faster-whisper-large-v3-turbo"),
     "cuda_dll_dir": "",          # folder with cublas64_12.dll / cudnn64_9.dll; empty = pip nvidia-* packages or PATH
-    "cache_dir": "",             # empty = <data>/cache
-    "gpu_lock": "",              # optional lock file shared with other GPU jobs; empty = none
-    "llm_url": "http://127.0.0.1:18081",
-    "llm_model": "qwen3.8-flash-next-iq3_s",
-    "llm_label": "Qwen3.8-Flash-Next",
-    "llm_controller": "",        # optional .ps1 accepting start | stop | status; empty = server must already run
-    "sample_wav": "",            # optional 16 kHz mono German WAV offered as a test source
+    "cache_dir": "",             # empty = <data root>/audio/cache
+    "sample_wav": "",           # optional 16 kHz mono German WAV offered as a test source
 }
+# Written by the single-package version; the gateway keeps its own copy now.
+RETIRED = ("llama_server", "hymt_model", "hymt_port", "stop_owned_server_on_exit", "gateway_port", "gateway_idle_seconds",
+           "gateway_lan", "gateway_networks", "gateway_cache", "gateway_cache_entries", "llm_parallel", "llm_url",
+           "llm_model", "llm_label", "llm_controller", "gpu_lock")  # caption sessions hold gpu_lock in the gateway
+
+LANGUAGES = gateway_config.LANGUAGES
 
 
 def load() -> dict:
+    gateway_config.migrate_legacy()
     cfg = dict(DEFAULTS)
     try:
         saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
@@ -86,7 +82,7 @@ def load() -> dict:
             cfg["source"] = "system"
         cfg["audio_source_version"] = 2
         cfg["translator"] = "qwen"
-        for retired in ("llama_server", "hymt_model", "hymt_port", "stop_owned_server_on_exit"):
+        for retired in RETIRED:
             cfg.pop(retired, None)
     except FileNotFoundError:
         pass
@@ -101,42 +97,6 @@ def save(cfg: dict) -> None:
     tmp = CONFIG_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, CONFIG_PATH)
-
-
-LANGUAGES = {"auto": "自动检测", "de": "德语", "en": "英语", "fr": "法语", "ja": "日语", "es": "西班牙语"}
-
-
-def shared_terms_path() -> Path:
-    return DATA_DIR / "gateway-terms.txt"
-
-
-def read_shared_terms(cfg: dict) -> str:
-    try:
-        return shared_terms_path().read_text(encoding="utf-8-sig")
-    except FileNotFoundError:
-        return cfg.get("terms", "")  # existing installations, until the first migration
-
-
-def save_shared_terms(raw: str, *, initialize=False) -> None:
-    """Publish a complete glossary; initialization never overwrites another editor."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with FileLock(str(DATA_DIR / "gateway-terms.lock"), timeout=5):
-        if initialize and shared_terms_path().exists():
-            return
-        with tempfile.NamedTemporaryFile(dir=DATA_DIR, delete=False, mode="w", encoding="utf-8") as f:
-            f.write(raw)
-        try:
-            os.replace(f.name, shared_terms_path())
-        finally:
-            Path(f.name).unlink(missing_ok=True)
-
-
-def shared_terms_revision():
-    try:
-        info = shared_terms_path().stat()
-        return info.st_mtime_ns, info.st_size, info.st_ino
-    except FileNotFoundError:
-        return None
 
 
 def cache_dir(cfg: dict) -> Path:

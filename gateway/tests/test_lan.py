@@ -4,18 +4,17 @@ import http.client
 import io
 import ipaddress
 import json
-import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from unittest.mock import Mock, patch
 
-from teams_caption import config, gateway_access
-from teams_caption.gateway import Gateway, Handler, Server, main
-from teams_caption.translate import _stream_chat, gateway_url, request_json
+from support import isolated_data
+from translation_gateway import access, config
+from translation_gateway.client import gateway_url, request_json, stream_chat
+from translation_gateway.server import Gateway, Handler, Server, main
 
 REMOTE = ipaddress.ip_address("192.168.1.20")
 PUBLIC = ipaddress.ip_address("203.0.113.9")
@@ -65,13 +64,7 @@ class Model(BaseHTTPRequestHandler):
 
 class LanGatewayTests(unittest.TestCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.folder = Path(tmp.name)
-        for key, value in (("DATA_DIR", self.folder), ("CONFIG_PATH", self.folder / "config.json")):
-            p = patch.object(config, key, value)
-            p.start()
-            self.addCleanup(p.stop)
+        self.folder = isolated_data(self)
         self.model = ThreadingHTTPServer(("127.0.0.1", 0), Model)
         self.model.calls, self.model.inflight, self.model.peak = [], 0, 0
         self.model.lock, self.model.unblock, self.model.aborted = threading.Lock(), threading.Event(), threading.Event()
@@ -112,19 +105,19 @@ class LanGatewayTests(unittest.TestCase):
         with patch.object(Handler, "_peer", return_value=REMOTE):
             status, _, data = self.call("POST", "/v1/translate", {"source": "Guten Tag"})
             self.assertEqual(status, 401, data)
-            token = gateway_access.add_device("mac")
+            token = access.add_device("mac")
             auth = {"Authorization": f"Bearer {token}"}
             status, _, data = self.call("POST", "/v1/translate", {"source": "Guten Tag"}, auth)
             self.assertEqual(status, 200, data)
             self.assertEqual(json.loads(data)["choices"][0]["message"]["content"], "第一句")
             self.assertEqual(self.call("GET", "/v1/models", headers=auth)[0], 200)
-            for path in ("/v1/captions", "/sessions/open", "/admin/stop"):
+            for path in ("/v1/captions", "/sessions/open", "/admin/stop", "/admin/terms"):
                 self.assertEqual(self.call("POST", path, {"source": "x"}, auth)[0], 403, path)
             self.assertFalse(self.state.stopping)
             self.assertEqual(self.call("POST", "/v1/translate", {"source": "x"}, {"Authorization": "Bearer wrong"})[0], 401)
-            self.assertTrue(gateway_access.revoke_device("mac"))
+            self.assertTrue(access.revoke_device("mac"))
             self.assertEqual(self.call("POST", "/v1/translate", {"source": "Guten Tag"}, auth)[0], 401)
-        token = gateway_access.add_device("phone")
+        token = access.add_device("phone")
         with patch.object(Handler, "_peer", return_value=PUBLIC):
             status, _, _ = self.call("POST", "/v1/translate", {"source": "Guten Tag"}, {"Authorization": f"Bearer {token}"})
             self.assertEqual(status, 403)
@@ -172,7 +165,7 @@ class LanGatewayTests(unittest.TestCase):
             wait_for(lambda: len(self.model.calls) == 1)
             second = pool.submit(self.post, "/v1/translate", {"source": "hold B"})
             wait_for(lambda: self.state.info()["queued_text"] == 1)
-            live = pool.submit(_stream_chat, gateway_url(self.cfg) + "/v1/captions",
+            live = pool.submit(stream_chat, gateway_url(self.cfg) + "/v1/captions",
                                {"source": "Die Presse hold", "session": session, "stream": True})
             wait_for(lambda: len(self.model.calls) == 2)
             self.assertEqual(self.state.info()["queued_text"], 1)
@@ -214,14 +207,14 @@ class LanGatewayTests(unittest.TestCase):
         status, headers, data = self.call("POST", "/v1/translate", request)
         self.assertEqual((status, headers["x-gateway-cache"]), (200, "hit"))
         self.assertEqual(json.loads(data)["choices"], first["choices"])
-        text, _, finish = _stream_chat(gateway_url(self.cfg) + "/v1/translate", dict(request, stream=True))
+        text, _, finish = stream_chat(gateway_url(self.cfg) + "/v1/translate", dict(request, stream=True))
         self.assertEqual((text, finish), ("第一句", "stop"))
         self.runtime.start.assert_not_called()
         self.assertEqual(len(self.model.calls), 1)
-        config.save_shared_terms("Tag=日子")  # a term in this sentence changes the prompt
+        config.save_terms("Tag=日子")  # a term in this sentence changes the prompt
         self.post("/v1/translate", request)
         self.assertEqual(len(self.model.calls), 2)
-        config.save_shared_terms("Tag=日子\nPresse=压力机")  # unrelated term: still a hit
+        config.save_terms("Tag=日子\nPresse=压力机")  # unrelated term: still a hit
         self.post("/v1/translate", request)
         self.assertEqual(len(self.model.calls), 2)
         for _ in range(2):
@@ -229,7 +222,7 @@ class LanGatewayTests(unittest.TestCase):
         self.assertEqual(len(self.model.calls), 4)
         session = self.state.session("open", None)["session"]
         for _ in range(2):
-            _stream_chat(gateway_url(self.cfg) + "/v1/captions", {"source": "Guten Tag", "session": session, "stream": True})
+            stream_chat(gateway_url(self.cfg) + "/v1/captions", {"source": "Guten Tag", "session": session, "stream": True})
         self.state.session("close", session)
         self.assertEqual(len(self.model.calls), 6)
         out = io.StringIO()
@@ -264,15 +257,15 @@ class LanGatewayTests(unittest.TestCase):
             self.assertEqual(main(["token-list"]), 0)
         token = out.getvalue().splitlines()[1]
         self.assertIn("iphone", out.getvalue().splitlines()[-1])
-        self.assertEqual(gateway_access.DeviceRegistry().lookup(token), "iphone")
-        self.assertNotIn(token, gateway_access.devices_path().read_text(encoding="utf-8"))
+        self.assertEqual(access.DeviceRegistry().lookup(token), "iphone")
+        self.assertNotIn(token, access.devices_path().read_text(encoding="utf-8"))
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(main(["token-revoke", "iphone"]), 0)
             self.assertEqual(main(["token-revoke", "iphone"]), 1)
-        self.assertIsNone(gateway_access.DeviceRegistry().lookup(token))
+        self.assertIsNone(access.DeviceRegistry().lookup(token))
 
     def test_network_policy(self):
-        peer, allowed, parse = gateway_access.peer_address, gateway_access.remote_allowed, gateway_access.parse_networks
+        peer, allowed, parse = access.peer_address, access.remote_allowed, access.parse_networks
         self.assertTrue(allowed(peer("192.168.1.20"), []))
         self.assertTrue(allowed(peer("::ffff:10.0.0.7"), []))
         self.assertFalse(allowed(peer("203.0.113.9"), []))
