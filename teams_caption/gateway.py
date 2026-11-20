@@ -1,12 +1,15 @@
-"""Loopback translation service and exclusive local-model test controls."""
+"""Translation gateway: one local model shared by captions and text clients on this PC and the LAN."""
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import re
 import secrets
 import select
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -20,12 +23,19 @@ from urllib.parse import urlsplit
 from filelock import FileLock, Timeout
 
 from . import config
+from .gateway_access import (LAN_NETWORKS, DeviceRegistry, add_device, list_devices, parse_networks, peer_address,
+                             remote_allowed, revoke_device)
+from .gateway_cache import TranslationCache
 from .glossary import Glossary
 from .model_runtime import ModelRuntime
 from .translate import ensure_gateway, gateway_url, request_json, status
 
 log = logging.getLogger(__name__)
 LOCAL = {"localhost", "127.0.0.1", "::1"}
+EXTENSION_SCHEMES = {"chrome-extension", "moz-extension", "safari-web-extension", "extension"}
+LOCAL_ONLY = {"/v1/captions", "/sessions/open", "/sessions/heartbeat", "/sessions/close", "/admin/stop"}
+CACHEABLE = {"/v1/translate", "/v1/chat/completions"}
+HEADER_NAME = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
 
 class ServiceError(Exception):
@@ -95,19 +105,97 @@ def translation_request(path, body, cfg, glossary):
     return payload
 
 
+def cache_key(payload):
+    """Everything that shapes the output, i.e. the upstream request minus transport options."""
+    stable = {k: v for k, v in payload.items() if k not in ("stream", "stream_options")}
+    return hashlib.sha256(json.dumps(stable, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def completion(meta, text, finish, usage=None):
+    result = {"id": meta["id"], "object": "chat.completion", "created": meta["created"], "model": meta["model"],
+              "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": finish}]}
+    if usage:
+        result["usage"] = usage
+    return result
+
+
+def _percentile(values, q):
+    ordered = sorted(values)
+    return round(ordered[min(len(ordered) - 1, round(q * (len(ordered) - 1)))], 3) if ordered else None
+
+
+class Stats:
+    """Per-device latency and cache counters. No request text is kept."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.clients = {}
+
+    def record(self, client, kind, outcome, *, first_token_s=None, queue_s=None, total_s=None):
+        with self.lock:
+            entry = self.clients.setdefault(client, {}).setdefault(kind, {
+                "requests": 0, "cache_hits": 0, "errors": 0, "cancelled": 0,
+                "first_token": deque(maxlen=200), "queue": deque(maxlen=200), "total": deque(maxlen=200)})
+            entry["requests"] += 1
+            entry["last_seen"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            if outcome == "hit":
+                entry["cache_hits"] += 1
+            elif outcome == "error":
+                entry["errors"] += 1
+            elif outcome == "cancelled":
+                entry["cancelled"] += 1
+            for name, value in (("first_token", first_token_s), ("queue", queue_s), ("total", total_s)):
+                if value is not None and outcome in ("ok", "hit"):
+                    entry[name].append(value)
+
+    def snapshot(self):
+        with self.lock:
+            report = {}
+            for client, kinds in self.clients.items():
+                for kind, e in kinds.items():
+                    report.setdefault(client, {})[kind] = {
+                        "requests": e["requests"], "cache_hits": e["cache_hits"],
+                        "cache_hit_rate": round(e["cache_hits"] / e["requests"], 3) if e["requests"] else 0,
+                        "errors": e["errors"], "cancelled": e["cancelled"], "last_seen": e.get("last_seen"),
+                        "first_token_p50_s": _percentile(e["first_token"], .5), "first_token_p95_s": _percentile(e["first_token"], .95),
+                        "queue_p50_s": _percentile(e["queue"], .5), "total_p50_s": _percentile(e["total"], .5),
+                        "total_p95_s": _percentile(e["total"], .95)}
+            return report
+
+
 class Gateway:
-    """One inference slot. Admission, leases and model unloading use the same condition."""
+    """Admission, leases and model unloading share one condition.
+
+    ``llm_parallel`` is the number of generations the inference server runs at once (1 for a
+    single-slot server). With two or more, text requests use at most all but one, so a caption
+    never waits for a long text generation.
+    """
     def __init__(self, cfg, runtime):
         self.cfg, self.runtime = cfg, runtime
         self.cv = threading.Condition()
         self.captions, self.bulk = deque(), deque()
         self.sessions = {}
-        self.active = None
-        self.loaded = self.stopping = False
-        self.last_used = time.monotonic()
+        self.parallel = max(1, int(cfg.get("llm_parallel", 1)))
+        self.running = {"caption": 0, "text": 0}
+        self.loaded = self.loading = self.unloading = self.stopping = False
+        self.load_lock = threading.Lock()
+        self.last_used = self.started = time.monotonic()
         self.gpu = FileLock(cfg["gpu_lock"], timeout=0, thread_local=False) if cfg.get("gpu_lock") else None
         self.glossary = Glossary("", phonetic=False)
         self.revision = object()
+        self.glossary_lock = threading.Lock()
+        self.networks = parse_networks(cfg.get("gateway_networks"))
+        self.devices = DeviceRegistry()
+        self.cache = (TranslationCache(config.cache_dir(cfg) / "translation-cache.sqlite3", cfg.get("gateway_cache_entries", 20000))
+                      if cfg.get("gateway_cache", True) else None)
+        self.stats = Stats()
+
+    def close(self):
+        if self.cache:
+            self.cache.close()
+
+    def _busy(self):
+        return sum(self.running.values())
 
     def _reserve_gpu(self):
         if self.gpu and not self.gpu.is_locked:
@@ -117,7 +205,7 @@ class Gateway:
                 raise ServiceError(409, "GPU 正由其他转写任务使用") from None
 
     def _release_gpu(self):
-        if self.gpu and self.gpu.is_locked and not (self.sessions or self.loaded or self.active or self.runtime.owned):
+        if self.gpu and self.gpu.is_locked and not (self.sessions or self.loaded or self.loading or self._busy() or self.runtime.owned):
             self.gpu.release()
 
     def _prune(self):
@@ -148,16 +236,46 @@ class Gateway:
             self.cv.notify_all()
             return {"session": token}
 
+    def _active(self):
+        if self.unloading:
+            return "unload"
+        return "caption" if self.running["caption"] else "text" if self.running["text"] else None
+
+    def _model_state(self):
+        return "unloading" if self.unloading else "loading" if self.loading else "ready" if self.loaded else "unloaded"
+
     def info(self):
         with self.cv:
             self._prune()
             return {"service": "audio-translation", "model": self.cfg["llm_model"], "loaded": self.loaded,
-                    "active": self.active, "caption_sessions": len(self.sessions), "queued_captions": len(self.captions),
+                    "active": self._active(), "caption_sessions": len(self.sessions), "queued_captions": len(self.captions),
                     "queued_text": len(self.bulk), "stopping": self.stopping}
+
+    def status_report(self):
+        with self.cv:
+            self._prune()
+            report = {"service": "audio-translation",
+                      "model": {"id": self.cfg["llm_model"], "label": self.cfg.get("llm_label") or self.cfg["llm_model"],
+                                "state": self._model_state(), "parallel": self.parallel,
+                                "idle_unload_s": self.cfg["gateway_idle_seconds"]},
+                      "running": dict(self.running), "queued": {"captions": len(self.captions), "text": len(self.bulk)},
+                      "caption_sessions": len(self.sessions), "stopping": self.stopping,
+                      "uptime_s": round(time.monotonic() - self.started)}
+        report["network"] = {"lan": bool(self.cfg.get("gateway_lan")), "port": int(self.cfg["gateway_port"]),
+                             "remote_networks": [str(n) for n in self.networks or LAN_NETWORKS], "devices": self.devices.count()}
+        report["cache"] = {"enabled": self.cache is not None, "entries": self.cache.count() if self.cache else 0}
+        report["clients"] = self.stats.snapshot()
+        return report
+
+    def _admissible(self, caption):
+        if self.unloading or self._busy() >= self.parallel:
+            return False
+        return caption or (not self.captions and self.running["text"] < max(1, self.parallel - 1))
 
     @contextmanager
     def slot(self, caption, token=None, disconnected=lambda: False):
         ticket = object()
+        kind = "caption" if caption else "text"
         queue = self.captions if caption else self.bulk
         with self.cv:
             if len(queue) >= (16 if caption else 32):
@@ -171,9 +289,9 @@ class Gateway:
                         raise ServiceError(409, "字幕会话已结束")
                     if disconnected():
                         raise ConnectionAbortedError("client disconnected")
-                    if not self.active and queue[0] is ticket and (caption or not self.captions):
+                    if queue[0] is ticket and self._admissible(caption):
                         self._reserve_gpu()
-                        self.active = "caption" if caption else "text"
+                        self.running[kind] += 1
                         break
                     self.cv.wait(.2)
             finally:
@@ -183,22 +301,33 @@ class Gateway:
             yield
         finally:
             with self.cv:
-                self.active = None
+                self.running[kind] -= 1
                 self.last_used = time.monotonic()
                 self._release_gpu()
                 self.cv.notify_all()
 
-    def prepare(self, path, body):
+    def build(self, path, body):
         revision = config.shared_terms_revision()
-        if self.revision != revision:
-            self.glossary = Glossary(config.read_shared_terms(self.cfg), phonetic=False)
-            self.revision = revision
-        payload = translation_request(path, body, self.cfg, self.glossary)
-        if not self.loaded or not self.runtime.ready():
-            self.runtime.start(log.info)
+        with self.glossary_lock:
+            if self.revision != revision:
+                self.glossary = Glossary(config.read_shared_terms(self.cfg), phonetic=False)
+                self.revision = revision
+            glossary = self.glossary
+        return translation_request(path, body, self.cfg, glossary)
+
+    def ensure_loaded(self):
+        with self.load_lock:
+            if self.loaded and self.runtime.ready():
+                return
+            with self.cv:
+                self.loading = True
+            try:
+                self.runtime.start(log.info)
+            finally:
+                with self.cv:
+                    self.loading = False
             with self.cv:
                 self.loaded = True
-        return payload
 
     def request_stop(self):
         with self.cv:
@@ -215,7 +344,7 @@ class Gateway:
                 self.loaded = False
         finally:
             with self.cv:
-                self.active = None
+                self.unloading = False
                 self.last_used = time.monotonic()
                 self._release_gpu()
                 self.cv.notify_all()
@@ -227,9 +356,9 @@ class Gateway:
                 if self.stopping:
                     return
                 idle = time.monotonic() - self.last_used
-                if (not self.active and not self.sessions and not self.captions and not self.bulk
+                if (not self._busy() and not self.loading and not self.sessions and not self.captions and not self.bulk
                         and (self.loaded or self.runtime.owned) and idle >= self.cfg["gateway_idle_seconds"]):
-                    self.active = "unload"
+                    self.unloading = True
                 else:
                     self.cv.wait(1)
                     continue
@@ -247,6 +376,20 @@ class Server(ThreadingHTTPServer):
         super().__init__(address, Handler)
 
 
+def _event(line):
+    """Parse one SSE line from the model: a dict, "done", or None for anything else."""
+    if not line.startswith(b"data:"):
+        return None
+    data = line[5:].strip()
+    if data == b"[DONE]":
+        return "done"
+    try:
+        event = json.loads(data)
+    except ValueError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -256,23 +399,60 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.settimeout(30)
         self.sent = False
 
-    def _local(self):
-        host = urlsplit("//" + self.headers.get("Host", "")).hostname
-        origin = self.headers.get("Origin")
-        if host not in LOCAL or (origin and urlsplit(origin).hostname not in LOCAL):
-            raise ServiceError(403, "仅允许本机访问")
+    def _peer(self):
+        return peer_address(self.client_address[0])
 
-    def _headers(self, code, mime, size=None):
+    def _bearer(self):
+        scheme, _, value = self.headers.get("Authorization", "").partition(" ")
+        return value.strip() if scheme.lower() == "bearer" else ""
+
+    def _origin_allowed(self, origin):
+        """CORS: browser extensions and local pages on this PC; any origin on an allowed LAN peer,
+        whose requests still need a device token."""
+        peer = self._peer()
+        if peer.is_loopback:
+            parts = urlsplit(origin)
+            return parts.scheme in EXTENSION_SCHEMES or (parts.scheme in ("http", "https") and parts.hostname in LOCAL)
+        return remote_allowed(peer, self.server.state.networks)
+
+    def _authorize(self, state, path):
+        """Return the client name: a device, or "local" for this PC without a token."""
+        peer = self._peer()
+        device = state.devices.lookup(self._bearer())
+        if peer.is_loopback:
+            if not device:  # Host and Origin checks keep web pages (DNS rebinding) out
+                origin = self.headers.get("Origin")
+                if urlsplit("//" + self.headers.get("Host", "")).hostname not in LOCAL or (origin and not self._origin_allowed(origin)):
+                    raise ServiceError(403, "仅允许本机访问")
+            return device or "local"
+        if not remote_allowed(peer, state.networks):
+            raise ServiceError(403, "来源地址不在允许的局域网范围内")
+        if not device:
+            raise ServiceError(401, "需要有效的设备 token（Authorization: Bearer …）")
+        if path in LOCAL_ONLY:
+            raise ServiceError(403, "该接口仅限本机使用")
+        return device
+
+    def _headers(self, code, mime, size=None, extra=None):
         self.send_response(code)
         self.send_header("Content-Type", mime)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
         origin = self.headers.get("Origin")
-        if origin and urlsplit(origin).hostname in LOCAL:
+        if origin and self._origin_allowed(origin):
+            requested = (h.strip() for h in self.headers.get("Access-Control-Request-Headers", "").split(","))
+            allowed = ["Content-Type", "Authorization"] + [h for h in requested if HEADER_NAME.match(h)
+                                                          and h.lower() not in ("content-type", "authorization")]
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Access-Control-Allow-Headers", ", ".join(allowed))
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Expose-Headers", "X-Gateway-Cache, Retry-After")
+            self.send_header("Access-Control-Max-Age", "600")
+            if self.headers.get("Access-Control-Request-Private-Network", "").lower() == "true":
+                self.send_header("Access-Control-Allow-Private-Network", "true")
+        for key, value in (extra or {}).items():
+            self.send_header(key, value)
         if size is not None:
             self.send_header("Content-Length", str(size))
         if code == 429:
@@ -280,41 +460,126 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.sent = True
 
-    def _json(self, code, value):
+    def _json(self, code, value, extra=None):
         data = json.dumps(value, ensure_ascii=False).encode()
-        self._headers(code, "application/json; charset=utf-8", len(data))
+        self._headers(code, "application/json; charset=utf-8", len(data), extra)
         self.wfile.write(data)
 
     def _disconnected(self):
         return bool(select.select([self.connection], [], [], 0)[0]) and not self.connection.recv(1, socket.MSG_PEEK)
 
-    def _translate(self, state, path, body):
-        with state.slot(path == "/v1/captions", body.get("session"), self._disconnected):
-            payload = state.prepare(path, body)
-            if self._disconnected():
+    def _send_cached(self, payload, text):
+        meta = {"id": "chatcmpl-cache-" + secrets.token_hex(8), "created": int(time.time()), "model": payload["model"]}
+        if not payload["stream"]:
+            self._json(200, completion(meta, text, "stop"), {"X-Gateway-Cache": "hit"})
+            return
+        self._headers(200, "text/event-stream; charset=utf-8", extra={"X-Gateway-Cache": "hit"})
+        chunk = dict(meta, object="chat.completion.chunk")
+        for choice in ({"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None},
+                       {"index": 0, "delta": {}, "finish_reason": "stop"}):
+            self.wfile.write(b"data: " + json.dumps(dict(chunk, choices=[choice]), ensure_ascii=False).encode() + b"\n\n")
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    def _generate(self, state, payload, marks):
+        """Always stream from the model, so a client that goes away also stops its generation.
+        Returns (text, finish_reason, complete), or None after the client disconnected."""
+        relay = payload["stream"]
+        request = urllib.request.Request(state.runtime.url + "/v1/chat/completions",
+                                         data=json.dumps(dict(payload, stream=True), ensure_ascii=False).encode(),
+                                         headers={"Content-Type": "application/json"})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        parts, finish, done, usage, seen = [], None, False, None, set()
+        meta = {"id": "chatcmpl-" + secrets.token_hex(8), "created": int(time.time()), "model": payload["model"]}
+        with opener.open(request, timeout=180) as upstream:
+            if relay:
+                self._headers(200, "text/event-stream; charset=utf-8", extra={"X-Gateway-Cache": "miss"})
+            for line in upstream:
+                if relay:
+                    self.wfile.write(line)
+                    self.wfile.flush()
+                elif self._disconnected():
+                    return None
+                event = _event(line)
+                if event == "done":
+                    done = True
+                    break
+                if event is None:
+                    continue
+                if event.get("error"):
+                    if relay:
+                        return "".join(parts), "error", False
+                    raise ServiceError(502, f"翻译流中断：{event['error']}")
+                for key in ("id", "created", "model"):
+                    if event.get(key) and key not in seen:
+                        meta[key] = event[key]
+                        seen.add(key)
+                usage = event.get("usage") or usage
+                for choice in event.get("choices") or []:
+                    delta = (choice.get("delta") or {}).get("content")
+                    if delta:
+                        marks.setdefault("first", time.monotonic())
+                        parts.append(delta)
+                    if choice.get("finish_reason"):
+                        finish = choice["finish_reason"]
+        text = "".join(parts)
+        complete = done or finish is not None
+        if not relay:
+            if not complete:
+                raise ServiceError(502, "本地翻译服务在译文完成前断开了连接")
+            self._json(200, completion(meta, text, finish or "stop", usage), {"X-Gateway-Cache": "miss"})
+        return text, finish, complete
+
+    def _translate(self, state, client, path, body):
+        caption = path == "/v1/captions"
+        kind = "caption" if caption else "text"
+        start, marks, outcome = time.monotonic(), {}, "error"
+        try:
+            payload = state.build(path, body)
+            key = cache_key(payload) if state.cache and path in CACHEABLE and payload.get("temperature") == 0 else None
+            cached = state.cache.get(key) if key else None
+            if cached is not None:
+                self._send_cached(payload, cached)
+                outcome = "hit"
                 return
-            request = urllib.request.Request(state.runtime.url + "/v1/chat/completions",
-                                             data=json.dumps(payload, ensure_ascii=False).encode(),
-                                             headers={"Content-Type": "application/json"})
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(request, timeout=180) as upstream:
-                if payload["stream"]:
-                    self._headers(200, "text/event-stream; charset=utf-8")
-                    for line in upstream:
-                        self.wfile.write(line)
-                        self.wfile.flush()
-                else:
-                    self._json(200, json.load(upstream))
+            with state.slot(caption, body.get("session"), self._disconnected):
+                marks["admitted"] = time.monotonic()
+                state.ensure_loaded()
+                if self._disconnected():
+                    outcome = "cancelled"
+                    return
+                result = self._generate(state, payload, marks)
+            if result is None:
+                outcome = "cancelled"
+                return
+            text, finish, complete = result
+            outcome = "ok" if complete and finish in (None, "stop") else "error"
+            if key and outcome == "ok" and text.strip():
+                state.cache.put(key, text, payload["model"])
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            outcome = "cancelled"
+            raise
+        finally:
+            end = time.monotonic()
+            state.stats.record(client, kind, outcome, total_s=end - start,
+                               first_token_s=marks["first"] - start if "first" in marks else (end - start if outcome == "hit" else None),
+                               queue_s=marks["admitted"] - start if "admitted" in marks else None)
 
     def _handle(self):
         state = self.server.state
         try:
-            self._local()
             path = urlsplit(self.path).path.rstrip("/")
             if self.command == "OPTIONS":
+                origin = self.headers.get("Origin")
+                if not origin or not self._origin_allowed(origin):
+                    raise ServiceError(403, "不允许的跨域来源")
                 self._headers(204, "text/plain", 0)
-            elif self.command == "GET" and path == "/health":
+                return
+            client = self._authorize(state, path)
+            if self.command == "GET" and path == "/health":
                 self._json(200, state.info())
+            elif self.command == "GET" and path == "/status":
+                self._json(200, state.status_report())
             elif self.command == "GET" and path == "/v1/models":
                 self._json(200, {"object": "list", "data": [{"id": state.cfg["llm_model"], "object": "model", "owned_by": "local"}]})
             elif self.command == "POST":
@@ -333,7 +598,7 @@ class Handler(BaseHTTPRequestHandler):
                     threading.Thread(target=self.server.shutdown, daemon=True).start()
                     self._json(200, {"stopping": True})
                 elif path in ("/v1/captions", "/v1/translate", "/v1/chat/completions"):
-                    self._translate(state, path, body)
+                    self._translate(state, client, path, body)
                 else:
                     raise ServiceError(404, "未知接口")
             else:
@@ -364,18 +629,24 @@ def serve(cfg):
             raise RuntimeError("检测到独立运行的 Qwen，请先从测试入口停止模型")
         config.save_shared_terms(cfg.get("terms", ""), initialize=True)
         state = Gateway(cfg, runtime)
-        with Server(("127.0.0.1", int(cfg["gateway_port"])), state) as server:
-            monitor = threading.Thread(target=state.maintain, name="model-idle")
-            monitor.start()
-            try:
-                server.serve_forever(poll_interval=.1)
-            finally:
-                with state.cv:
-                    state.stopping = True
-                    state.cv.notify_all()
-                server.server_close()
-                monitor.join()
-                state.unload()
+        host = "0.0.0.0" if cfg.get("gateway_lan") else "127.0.0.1"
+        if cfg.get("gateway_lan") and not state.devices.count():
+            log.warning("已开放局域网访问，但还没有设备 token。运行 translation-gateway.cmd token-add <设备名> 添加。")
+        try:
+            with Server((host, int(cfg["gateway_port"])), state) as server:
+                monitor = threading.Thread(target=state.maintain, name="model-idle")
+                monitor.start()
+                try:
+                    server.serve_forever(poll_interval=.1)
+                finally:
+                    with state.cv:
+                        state.stopping = True
+                        state.cv.notify_all()
+                    server.server_close()
+                    monitor.join()
+                    state.unload()
+        finally:
+            state.close()
 
 
 def test_control(cfg, action):
@@ -403,10 +674,36 @@ def test_control(cfg, action):
             marker.unlink(missing_ok=True)
 
 
+def device_control(cfg, action, name):
+    if action == "token-list":
+        devices = list_devices()
+        for device in devices:
+            print(f"{device['name']}\t{device['created']}")
+        if not devices:
+            print("还没有设备 token")
+        return
+    if not name:
+        raise RuntimeError(f"用法：translation-gateway.cmd {action} <设备名>")
+    if action == "token-revoke":
+        if not revoke_device(name):
+            raise RuntimeError(f"没有名为 {name} 的设备")
+        print(f"已吊销设备 {name}，运行中的网关立即生效")
+        return
+    token = add_device(name)
+    print(f"设备 {name} 的 token（只显示这一次，请立即填进该设备的客户端）：")
+    print(token)
+    print(f"客户端设置：Base URL http://<这台电脑的局域网 IP>:{int(cfg['gateway_port'])}/v1 ，API Key 填上面的 token。")
+    if not cfg.get("gateway_lan"):
+        print("提示：config.json 中 gateway_lan 仍为 false，改为 true 并重启网关后其他设备才能连接。")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Local audio/text translation gateway")
-    parser.add_argument("action", choices=["serve", "start", "stop", "status", "test-start", "test-stop", "test-check"])
-    action = parser.parse_args(argv).action
+    parser.add_argument("action", choices=["serve", "start", "stop", "status", "test-start", "test-stop", "test-check",
+                                           "token-add", "token-list", "token-revoke", "cache-clear"])
+    parser.add_argument("name", nargs="?", help="设备名（token-add / token-revoke）")
+    args = parser.parse_args(argv)
+    action = args.action
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = config.load()
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -428,12 +725,20 @@ def main(argv=None):
                     if cfg.get("llm_controller") and not testing and ModelRuntime(cfg, log.info).ready():
                         raise RuntimeError("网关已退出，模型仍在运行。请用 test-stop 结束本机模型。")
             print("翻译网关已关闭")
+        elif action.startswith("token-"):
+            device_control(cfg, action, args.name)
+        elif action == "cache-clear":
+            cache = TranslationCache(config.cache_dir(cfg) / "translation-cache.sqlite3")
+            try:
+                print(f"已清除 {cache.clear()} 条翻译缓存")
+            finally:
+                cache.close()
         else:
             test_control(cfg, action)
     except Timeout:
         print("翻译服务或测试操作正在运行。请先停止字幕并关闭翻译网关，再启动本地 AI 测试。", file=sys.stderr)
         return 1
-    except (RuntimeError, OSError) as exc:
+    except (RuntimeError, OSError, sqlite3.Error) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     return 0

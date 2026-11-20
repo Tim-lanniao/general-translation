@@ -64,6 +64,7 @@ class GatewayTests(unittest.TestCase):
         self.runtime = Mock(owned=False, url=f"http://127.0.0.1:{self.up.server_port}")
         self.cfg = dict(config.DEFAULTS, gateway_idle_seconds=.05, gpu_lock=str(self.folder / "shared.lock"))
         self.state = Gateway(self.cfg, self.runtime)
+        self.addCleanup(self.state.close)
         self.addCleanup(self.state.unload)
         self.server = Server(("127.0.0.1", 0), self.state)
         self.cfg["gateway_port"] = self.server.server_port
@@ -95,7 +96,7 @@ class GatewayTests(unittest.TestCase):
             self.up.unblock.set()
             self.assertEqual(live.result()[0], "第一句")
             self.assertEqual(previews, ["第", "第一句"])
-            self.assertEqual(first.result(), bulk.result())
+            self.assertEqual(first.result()["choices"], bulk.result()["choices"])
         order = [p["messages"][-1]["content"] for p in self.up.calls]
         self.assertEqual([x.splitlines()[-1] for x in order], ["hold", "Die Presse", "third"])
         self.assertIn("Presse=压力机", self.up.calls[1]["messages"][0]["content"])

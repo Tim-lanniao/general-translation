@@ -51,6 +51,11 @@ DEFAULTS = {
     "idle_release_minutes": 45,
     "gateway_port": 18083,
     "gateway_idle_seconds": 300,
+    "gateway_lan": False,        # also listen on the LAN; remote clients need a device token
+    "gateway_networks": [],      # remote client networks in CIDR; empty = private LAN ranges
+    "gateway_cache": True,       # reuse finished text translations (captions are never cached)
+    "gateway_cache_entries": 20000,
+    "llm_parallel": 1,           # generations the inference server runs at once (Strata parallel requests)
     # ---- pipeline (values from the author's real-time replay evaluation)
     "window_seconds": 12,
     "update_seconds": 2,

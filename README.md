@@ -35,6 +35,9 @@ Copy-Item config.example.json data\config.json
 | `llm_url`、`llm_model`、`llm_label` | 网关访问的推理服务、模型标识和显示名称 |
 | `llm_controller` | 接受 `start`、`stop`、`status` 的 PowerShell 控制脚本，网关用它按需启停模型。留空时需要自行保持上游服务在线 |
 | `gateway_port`、`gateway_idle_seconds` | 网关默认监听 127.0.0.1:18083，闲置 300 秒后卸载托管的模型 |
+| `gateway_lan`、`gateway_networks` | 设为 `true` 后同时向局域网开放，见下文「局域网里的其他设备」。网段默认只放行局域网私有地址 |
+| `llm_parallel` | 推理服务能同时生成的请求数，默认 1。Strata 开启并行请求后填同样的数 |
+| `gateway_cache`、`gateway_cache_entries` | 文本翻译缓存，默认开启，最多 20,000 条 |
 | `gpu_lock` | 可选共享锁，字幕识别或托管模型占用显卡期间与其他 GPU 作业互斥 |
 | `sample_wav` | 可选的 16 kHz 单声道 WAV，在声音来源中作为回放样例 |
 
@@ -47,8 +50,36 @@ Copy-Item config.example.json data\config.json
 | `POST /v1/translate` | 提交 `source`，可选 `source_language`、`context`、`topic`、`stream`，返回简体中文 |
 | `POST /v1/chat/completions` | OpenAI 风格的文本消息接口，支持 JSON 或 SSE 流式返回，保留前端的翻译指令 |
 | `GET /health` | 查看模型加载状态、字幕会话数及两条等待队列 |
+| `GET /status` | 模型状态（未加载、加载中、就绪、卸载中）、并行数、各队列、缓存条数，以及每台设备的请求数、缓存命中率、首字与总耗时（P50/P95）。不含任何原文或译文 |
 
-网关统一关闭 Qwen 的思考模式，并把当前句匹配的词对加入提示。单槽模型同一时间只生成一个请求。字幕会排在等待中的批量请求前面，已开始生成的段落会先完成。批量前端请按段提交，单段最多生成 512 个 token，普通队列最多等待 32 项。收到 HTTP 429 后按 `Retry-After` 重试。若响应的 `finish_reason` 为 `length`，请缩短原段后重译。
+网关统一关闭 Qwen 的思考模式，并把当前句匹配的词对加入提示。字幕会排在等待中的批量请求前面。`llm_parallel` 为 1 时同一时间只生成一个请求，已开始生成的段落会先完成。设为 2 或更大时，文本请求最多同时占用 `llm_parallel − 1` 个，总给字幕留一个空位。批量前端请按段提交，单段最多生成 512 个 token，普通队列最多等待 32 项。收到 HTTP 429 后按 `Retry-After` 重试。若响应的 `finish_reason` 为 `length`，请缩短原段后重译。
+
+网关始终以流式向模型取词，即使前端要的是普通 JSON 响应。前端断开连接（例如关掉网页或滚走）时，网关立即断开模型请求并释放空位，不再替它生成剩余段落。
+
+### 文本翻译缓存
+
+`/v1/translate` 和 `/v1/chat/completions` 的完整译文会写入缓存目录的 `translation-cache.sqlite3`。缓存键是发给模型的完整请求：模型、消息、本句命中的术语、采样参数。改动本句用到的术语后它会重新翻译，改动其他词条不影响已有缓存。命中时不排队、不加载模型，响应头带 `X-Gateway-Cache: hit`。只有 `temperature` 为 0 或未填写的请求会被缓存。字幕从不进入缓存。缓存里保存原文和译文，不需要时把 `gateway_cache` 设为 `false`，或运行 `translation-gateway.cmd cache-clear` 清空。
+
+### 浏览器扩展
+
+本机浏览器扩展（如沉浸式翻译）可直接使用 `http://127.0.0.1:18083/v1`，API key 填 `local`。网关接受 `chrome-extension://`、`moz-extension://` 等扩展来源的跨域预检；普通网页仍只能从本机地址访问。
+
+## 局域网里的其他设备
+
+例如让同一局域网里的 Mac 也用这台电脑上的 Qwen：
+
+1. 在 `data\config.json` 里设置 `"gateway_lan": true`，然后重启网关（`translation-gateway.cmd stop` 后重新启动字幕或 `start`）。
+2. 为每台设备生成 token：`.\translation-gateway.cmd token-add mac`。token 只显示这一次，数据目录的 `gateway-devices.json` 只保存它的 SHA-256。`token-list` 查看设备，`token-revoke mac` 吊销，运行中的网关立即生效。
+3. 用管理员 PowerShell 放行端口，只允许专用网络和该设备的地址：
+
+   ```powershell
+   New-NetFirewallRule -DisplayName "Translation gateway (LAN)" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 18083 -Profile Private -RemoteAddress 192.168.1.20
+   ```
+
+   首次以局域网模式启动时若弹出 Windows 防火墙提示，只勾选「专用网络」并允许。点取消可能生成阻止规则，使上面的放行失效。
+4. 建议在路由器里为两台电脑保留固定 IP。设备上的客户端填写 Base URL `http://<这台电脑的 IP>:18083/v1`，API key 填设备 token。
+
+其他设备只能使用 `/v1/translate`、`/v1/chat/completions`、`/v1/models`、`/health` 和 `/status`。字幕接口、会话和关闭网关只接受本机请求。请求必须带 `Authorization: Bearer <token>`，来源地址默认须在 10.0.0.0/8、172.16.0.0/12、192.168.0.0/16 或 IPv6 本地地址内，可用 `gateway_networks` 改为其他 CIDR 网段。局域网设备的跨域请求接受任意来源，但仍须携带 token。通信为明文 HTTP，请只在信任的网络里开放。
 
 ```powershell
 $body = @{ source = 'Der Termin ist am Dienstag.'; source_language = 'de' } | ConvertTo-Json
